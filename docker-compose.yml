@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  gem_mpc_solver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gem_mpc_image
+    container_name: gem_mpc_container
+    # 'host' network mode is easiest for ROS to communicate with local machine if needed
+    network_mode: host 
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - LIBGL_ALWAYS_SOFTWARE=1
+      - NVIDIA_ visible_devices=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      # Mount X11 socket for GUI (Gazebo/RViz)
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      # Mount your current directory to the src folder in the container
+      # This allows you to edit code on your host and run it in the container
+      - ./:/root/catkin_ws/src/assignment
+    
+    # UNCOMMENT the section below if you have an NVIDIA GPU and nvidia-container-toolkit installed
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    stdin_open: true
+    tty: true
