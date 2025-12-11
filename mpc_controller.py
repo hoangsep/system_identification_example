@@ -30,17 +30,26 @@ if 'numpy._core' not in sys.modules:
     sys.modules['numpy._core'] = np.core
 
 # MPC Settings
-HORIZON = 30           # Look ahead steps (Increased 10->20 for better recovery)
-DT = 0.05              # Time step (Must match your data recorder freq, e.g., 20Hz = 0.05)
+HORIZON = 6           # Keep horizon small for faster solve
+PUBLISH_DEBUG_MARKERS = True  # Set True to visualize (adds overhead)
+DT = 0.1              # Time step (Must match your data recorder freq, e.g., 20Hz = 0.05)
 L_WHEELBASE = 1.75     # Meters (approx for Polaris GEM)
 
 # CSV Column Mapping (Based on your snippet)
 COL_X = 0
 COL_Y = 1
 COL_YAW = 2
-# COL_V = 4   # Using the dynamic speed from the CSV
+COL_V = 4   # Using the dynamic speed from the CSV
 MIN_REF_V = 0.5       # m/s floor to avoid stalling at start
 MAX_REF_V = 5.5       # match controller speed limit
+
+# Look-ahead tuning: shift the target path slightly ahead of the car
+# Fix: Lookahead MUST be > Wheelbase (1.75m) for stability.
+PREVIEW_MIN = 1.0     
+PREVIEW_BASE = 2.0    # Increased from 0.3 to stabilize (Pure Pursuit rule: L > 1.2*Wheelbase)
+PREVIEW_GAIN = 0.5    # Scale with speed
+PREVIEW_MAX = 5.0     
+PREVIEW_CTE_GAIN = 0.5 # Reduced aggression on large errors
 
 class NeuralMPC:
     def __init__(self):
@@ -50,6 +59,8 @@ class NeuralMPC:
         self.cte_history = []
         self.rate = rospy.Rate(1.0 / DT)  # stay in sync with the model/control timestep
         self.initialized = False
+        self.prev_u_opt = None
+        self.prev_x_opt = None
         
         # --- 1. Load Scalers ---
         # We need these to normalize inputs for the neural net inside the solver.
@@ -71,17 +82,17 @@ class NeuralMPC:
         # header=None because you said the file just starts with numbers
         df = pd.read_csv(PATH_CSV, header=None)
         self.full_path = df.values # Numpy array
-        # Pre-compute average segment length to scale index stepping (protect against ultra-dense points)
         if len(self.full_path) > 1:
             diffs = np.diff(self.full_path[:, [COL_X, COL_Y]], axis=0)
             seg_lens = np.linalg.norm(diffs, axis=1)
+            self.path_s = np.concatenate(([0.0], np.cumsum(seg_lens)))
             self.avg_path_ds = float(np.clip(np.mean(seg_lens), 1e-4, 10.0))
+            self.total_path_length = float(self.path_s[-1])
         else:
+            self.path_s = np.array([0.0], dtype=float)
             self.avg_path_ds = 0.1
-        print(f"Path loaded: {len(self.full_path)} points")
-
-        # --- 3.5 Teleport to Start ---
-        # Moved to end of init to ensure publisher exists
+            self.total_path_length = 0.0
+        print(f"Path loaded: {len(self.full_path)} points (length {self.total_path_length:.2f} m)")
 
 
         # --- 4. Setup MPC Solver ---
@@ -93,7 +104,8 @@ class NeuralMPC:
         
         # Publisher for control commands
         self.pub = rospy.Publisher('/gem/ackermann_cmd', AckermannDrive, queue_size=1)
-        self.vis_pub = rospy.Publisher('/gem/mpc_debug', MarkerArray, queue_size=1)
+        # Latch debug markers so RViz doesn't briefly clear them if a message is dropped
+        self.vis_pub = rospy.Publisher('/gem/mpc_debug', MarkerArray, queue_size=5, latch=True)
         
         
         # Subscriber for Ground Truth state (Since no Odom/Map frame exists)
@@ -101,9 +113,113 @@ class NeuralMPC:
 
         # --- 6. Teleport to Start ---
         self.teleport_to_start()
+        # pub 0 speed and steering angle
+        self.pub.publish(AckermannDrive(speed=0.0, steering_angle=0.0))
         
         print("MPC Controller Ready. Waiting for Gazebo state...")
         self.initialized = True
+
+    def build_initial_guess(self, ref_traj, use_prev=True):
+        """Build initial guesses for X and U (warm start or simple heading-based seed)."""
+        curr_x, curr_y, curr_yaw, curr_v = self.current_state
+
+        # Controls: shift previous if available
+        if use_prev and self.prev_u_opt is not None and np.all(np.isfinite(self.prev_u_opt)):
+            u_guess = np.hstack((self.prev_u_opt[:, 1:], self.prev_u_opt[:, -1:]))
+        else:
+            # Simple seed: aim at the first reference point with a steady speed
+            ref_x, ref_y, _, ref_v = ref_traj[:, 0]
+            heading_to_ref = np.arctan2(ref_y - curr_y, ref_x - curr_x)
+            heading_err = self.wrap_angle(heading_to_ref - curr_yaw)
+            steer_guess = float(np.clip(heading_err, -0.4, 0.4))
+            speed_guess = float(np.clip(ref_v if np.isfinite(ref_v) else curr_v, MIN_REF_V, MAX_REF_V))
+            u_guess = np.zeros((2, HORIZON))
+            u_guess[0, :] = speed_guess
+            u_guess[1, :] = steer_guess
+
+        # States: re-rollout from the CURRENT state using the guessed controls.
+        # This keeps the initial guess dynamically consistent instead of simply
+        # shifting the previous predicted states (which can drift and hurt IPOPT).
+        x_guess = np.zeros((4, HORIZON + 1))
+        x_guess[:, 0] = [curr_x, curr_y, curr_yaw, curr_v]
+        temp_state = np.array([curr_x, curr_y, curr_yaw, curr_v], dtype=float)
+        for k in range(HORIZON):
+            dx = self.rollout_dynamics_np(temp_state, u_guess[:, k])
+            temp_state = temp_state + dx
+            temp_state[2] = self.wrap_angle(temp_state[2])
+            x_guess[:, k + 1] = temp_state
+
+        # Guard against NaNs/Infs from the warm rollout
+        if not np.all(np.isfinite(x_guess)):
+            x_guess = np.zeros((4, HORIZON + 1))
+            for k in range(HORIZON + 1):
+                dist = curr_v * DT * k
+                x_guess[0, k] = curr_x + dist * np.cos(curr_yaw)
+                x_guess[1, k] = curr_y + dist * np.sin(curr_yaw)
+                x_guess[2, k] = curr_yaw
+                x_guess[3, k] = curr_v
+
+        return x_guess, u_guess
+
+    @staticmethod
+    def wrap_angle(angle):
+        """Wrap angle to [-pi, pi]."""
+        while angle > np.pi:
+            angle -= 2 * np.pi
+        while angle < -np.pi:
+            angle += 2 * np.pi
+        return angle
+
+    @staticmethod
+    def wrap_angle_casadi(angle):
+        """CasADi-safe angle wrap to [-pi, pi] using atan2."""
+        return ca.atan2(ca.sin(angle), ca.cos(angle))
+
+    def index_ahead_by_distance(self, start_idx, distance):
+        """Return the path index at least `distance` meters ahead of start_idx."""
+        if len(self.path_s) == 0:
+            return 0
+        start_idx = int(np.clip(start_idx, 0, len(self.path_s) - 1))
+        if distance <= 0.0 or start_idx >= len(self.path_s) - 1:
+            return start_idx
+        target_s = self.path_s[start_idx] + distance
+        idx = int(np.searchsorted(self.path_s, target_s, side='left'))
+        return min(idx, len(self.path_s) - 1)
+
+    def rollout_dynamics_np(self, state, control):
+        """Roll the learned dynamics once in numpy for building warm starts."""
+        v_actual, v_cmd, steer_cmd = state[3], control[0], control[1]
+        inp = np.array([v_actual, v_cmd, steer_cmd, DT], dtype=float)
+        inp_norm = (inp - self.sx_mean) / self.sx_scale
+
+        act = np.tanh
+        h1 = act(self.weights['net.0.weight'].dot(inp_norm) + self.weights['net.0.bias'])
+        h2 = act(self.weights['net.2.weight'].dot(h1) + self.weights['net.2.bias'])
+        h3 = act(self.weights['net.4.weight'].dot(h2) + self.weights['net.4.bias'])
+        out_norm = self.weights['net.6.weight'].dot(h3) + self.weights['net.6.bias']
+        out_real = out_norm * self.sy_scale + self.sy_mean
+
+        yaw_curr = state[2]
+        dx_glob = np.cos(yaw_curr) * out_real[0] - np.sin(yaw_curr) * out_real[1]
+        dy_glob = np.sin(yaw_curr) * out_real[0] + np.cos(yaw_curr) * out_real[1]
+        return np.array([dx_glob, dy_glob, out_real[2], out_real[3]], dtype=float)
+
+    def solve_with_guess(self, ref_traj, use_prev=True):
+        """Try solving with either a warm start (use_prev=True) or cold start."""
+        try:
+            x_guess, u_guess = self.build_initial_guess(ref_traj, use_prev=use_prev)
+            self.opti.set_value(self.P_current, self.current_state)
+            self.opti.set_value(self.P_ref, ref_traj)
+            self.opti.set_initial(self.X_var, x_guess)
+            self.opti.set_initial(self.U_var, u_guess)
+            return self.opti.solve()
+        except Exception as e:
+            if use_prev:
+                # Clear the cached warm start so the next iteration does not keep failing.
+                self.prev_u_opt = None
+                self.prev_x_opt = None
+                print(f"Solver warm-start failed ({e}); trying cold start.")
+            return None
 
     def load_scalers(self):
         """Load scaler stats from pickle, fallback to npz arrays if pickle fails."""
@@ -140,32 +256,43 @@ class NeuralMPC:
         self.U_var = opti.variable(2, HORIZON)     # [v_cmd, steer_cmd]
         
         # --- Parameters ---
-        self.P_current = opti.parameter(4)
-        self.P_ref = opti.parameter(4, HORIZON) 
+        self.P_current = opti.parameter(4) # [x, y, yaw, v]
+        self.P_ref = opti.parameter(4, HORIZON) # [x, y, yaw, v]
 
         # --- Cost Function Weights (TUNED) ---
-        Q_pos = 120.0   # Lowered vs position-heavy tuning to let speed tracking matter more
-        Q_yaw = 40.0
-        Q_vel = 100.0   # Strongly track the reference speed
-        R_steer = 1.0   
-        R_accel = 0.2   # Allow faster accel to reach target speed
-        R_dsteer = 2.0  # Moderate smoothness
+        Q_lat = 10.0    
+        Q_yaw = 20.0     
+        Q_vel = 5.0 
+        R_steer = 1.0    
+        R_accel = 1.0 
+        R_dsteer = 150.0 
+        Q_safety = 5.0   
 
         cost = 0
         for k in range(HORIZON):
-            e_x = self.X_var[0, k+1] - self.P_ref[0, k]
-            e_y = self.X_var[1, k+1] - self.P_ref[1, k]
-            e_yaw = self.X_var[2, k+1] - self.P_ref[2, k]
+            dx = self.X_var[0, k+1] - self.P_ref[0, k]
+            dy = self.X_var[1, k+1] - self.P_ref[1, k]
+            ref_yaw = self.P_ref[2, k]
+            e_lat = -ca.sin(ref_yaw) * dx + ca.cos(ref_yaw) * dy
+            yaw_diff = self.X_var[2, k+1] - self.P_ref[2, k]
+            e_yaw = self.wrap_angle_casadi(yaw_diff)
             e_v = self.X_var[3, k+1] - self.P_ref[3, k]
 
-            cost += Q_pos * (e_x**2 + e_y**2)
+            cost += Q_lat * (e_lat**2)
             cost += Q_yaw * (e_yaw**2)
             cost += Q_vel * (e_v**2)
             
+            # Control Regularization
             cost += R_accel * (self.U_var[0, k]**2)
             cost += R_steer * (self.U_var[1, k]**2)
 
+            # --- SAFETY COST: Slow down when steering ---
+            # Penalize (velocity * steering_angle)^2
+            # This encourages low velocity if steering is high, or low steering if velocity is high
+            cost += Q_safety * (self.U_var[0, k] * self.U_var[1, k])**2
+
             if k < HORIZON - 1:
+                # Damping: Penalize rapid changes in steering
                 cost += R_dsteer * (self.U_var[1, k+1] - self.U_var[1, k])**2
 
         opti.minimize(cost)
@@ -176,7 +303,7 @@ class NeuralMPC:
         for k in range(HORIZON):
             # Velocity & Steering Limits
             # Prevent reverse by disallowing negative speed commands
-            opti.subject_to(opti.bounded(0.0, self.U_var[0, k], 5.5))
+            opti.subject_to(opti.bounded(MIN_REF_V, self.U_var[0, k], MAX_REF_V))
             opti.subject_to(opti.bounded(-0.6, self.U_var[1, k], 0.6))
 
             # --- Neural Network Dynamics (Reconstruction) ---
@@ -205,6 +332,13 @@ class NeuralMPC:
             
             out_real = out_norm * self.sy_scale + self.sy_mean
             
+            # --- MODEL CORRECTION GAIN ---
+            # Validation showed the trained model underestimates Yaw Rate by ~6x.
+            # Since we cannot retrain, we manually boost the predicted yaw change.
+            # This makes the MPC realize the car turns fast, so it commands smoother/smaller steering.
+            YAW_GAIN = 5.0 
+            out_real[2] = out_real[2] * YAW_GAIN
+            
             # Global Frame Update
             yaw_curr = state_k[2]
             dx_glob = ca.cos(yaw_curr)*out_real[0] - ca.sin(yaw_curr)*out_real[1]
@@ -215,15 +349,17 @@ class NeuralMPC:
             opti.subject_to(self.X_var[2, k+1] == state_k[2] + out_real[2])
             opti.subject_to(self.X_var[3, k+1] == state_k[3] + out_real[3])
 
-        # --- SOLVER SETTINGS (CRITICAL UPDATE) ---
+        # --- SOLVER SETTINGS ---
         opts = {
             'ipopt.print_level': 0, 
             'print_time': 0, 
             'ipopt.sb': 'yes',
-            'ipopt.max_iter': 500,           # <--- CHANGED: Increased 100->500 to help L-BFGS cleanup
-            'ipopt.hessian_approximation': 'limited-memory', # <--- FAST SOLVER MODE (L-BFGS)
-            # 'ipopt.accept_after_max_steps': 'yes', 
-            'ipopt.tol': 1e-2,               # <--- Loosened tolerance (1e-3 -> 1e-2) for faster convergence
+            'ipopt.max_iter': 1000,         
+            'ipopt.max_cpu_time': 0.5,     # seconds
+            'ipopt.hessian_approximation': 'limited-memory', # L-BFGS
+            'ipopt.tol': 1e-2,
+            'ipopt.acceptable_tol': 1e-1,
+            'ipopt.acceptable_obj_change_tol': 1e-3,
             'ipopt.warm_start_init_point': 'yes'
         }
         opti.solver('ipopt', opts)
@@ -231,15 +367,9 @@ class NeuralMPC:
     def state_callback(self, msg):
         """Extracts robot state from Gazebo ModelStates"""
         try:
-            # We look for the model named 'gem' or 'polaris'
-            # If your simulation uses a different name, change it here!
+            # We look for the model named 'gem' 
             names = msg.name
-            if "gem" in names:
-                idx = names.index("gem")
-            elif "polaris" in names:
-                idx = names.index("polaris")
-            else:
-                return # Robot not found yet
+            idx = names.index("gem")
 
             p = msg.pose[idx].position
             q = msg.pose[idx].orientation
@@ -264,7 +394,7 @@ class NeuralMPC:
             # 1. Get First Waypoint
             start_x = self.full_path[0, COL_X]
             start_y = self.full_path[0, COL_Y]
-            start_yaw = self.full_path[0, COL_YAW]
+            start_yaw = self.wrap_angle(float(self.full_path[0, COL_YAW]))
             
             # 2. Prepare Gazebo State Msg
             state_msg = ModelState()
@@ -297,7 +427,7 @@ class NeuralMPC:
             print(f"Service call failed: {e}")
 
     def get_reference_trajectory(self):
-        """Finds the nearest point on the CSV path and slices the next N points"""
+        """Find the nearest path point and build a distance-sampled horizon."""
         if self.current_state is None:
             return None
 
@@ -316,40 +446,34 @@ class NeuralMPC:
         # 2. Slice the path for the Horizon using DISTANCE based lookahead
         # (Fixes issue where dense points at standstill cause microscopic horizon)
         ref_traj = []
-        last_idx = nearest_idx
         
-        # We want roughly v*DT distance between points, but at least MIN_DIST
-        # so we always see ahead. Use avg_path_ds to convert distance to index
-        # steps; cap the step to avoid jumping to the end on very dense paths.
         current_v = self.current_state[3]
-        target_step_dist = max(current_v * DT, 0.2) # Minimum 0.2m spacing (4m horizon at 20 steps)
-        avg_ds = max(1e-4, getattr(self, "avg_path_ds", 0.1))
-        max_step_points = 50  # prevent running to path end when points are extremely dense
+        target_step_dist = max(current_v * DT, 0.8)
+        # Preview the target forward so the nonholonomic vehicle tracks a feasible point
+        # Boost lookahead when laterally far to avoid lateral-only targets (car can't strafe)
+        lookahead_raw = PREVIEW_BASE + PREVIEW_GAIN * current_v + PREVIEW_CTE_GAIN * cte
+        lookahead_dist = np.clip(lookahead_raw, PREVIEW_MIN, PREVIEW_MAX)
+        start_idx = self.index_ahead_by_distance(nearest_idx, lookahead_dist)
+        last_idx = start_idx
         
         for i in range(HORIZON):
-            # 1. Start with the nearest/last point
+            # 1. Start with the previewed point, then march forward
             if i == 0:
-                idx = nearest_idx
+                idx = start_idx
             else:
-                step_points = int(np.clip(round(target_step_dist / avg_ds), 1, max_step_points))
-                idx = min(last_idx + step_points, len(self.full_path) - 1)
-                last_idx = idx
-
-            # Handle end of path
-            if idx >= len(self.full_path):
-                idx = len(self.full_path) - 1
+                idx = self.index_ahead_by_distance(last_idx, target_step_dist)
 
             row = self.full_path[idx]
             
             # Extract [x, y, yaw, v]
             ref_x = row[COL_X]
             ref_y = row[COL_Y]
-            ref_yaw = row[COL_YAW]
-            ref_v = 1.0
-            # ref_v = float(np.clip(row[COL_V], MIN_REF_V, MAX_REF_V))
+            ref_yaw = self.wrap_angle(float(row[COL_YAW]))
+            ref_v = float(np.clip(row[COL_V], MIN_REF_V, MAX_REF_V))
             # print(f"Ref Point {i}: ({ref_x:.2f}, {ref_y:.2f}), Yaw: {ref_yaw:.2f}, V: {ref_v:.2f}")
             
             ref_traj.append([ref_x, ref_y, ref_yaw, ref_v])
+            last_idx = idx
 
         # print(f"nearest_idx: {nearest_idx}, ref: {ref_traj[0]}, CTE: {cte:.2f}m")
 
@@ -361,51 +485,37 @@ class NeuralMPC:
             rospy.logerr("NeuralMPC failed to initialize; aborting run().")
             return
         # Warm start memory
-        self.prev_u_opt = np.zeros((2, HORIZON))
-        self.prev_x_opt = np.zeros((4, HORIZON + 1))
+        self.prev_u_opt = None
+        self.prev_x_opt = None
         
         last_u = [0.0, 0.0] # Store last control for fallback
 
         
         while not rospy.is_shutdown():
             if self.current_state is None:
+                print("Current state is None; skipping iteration.")
                 self.rate.sleep()
                 continue
                 
             try:
                 ref_traj = self.get_reference_trajectory()
-                if ref_traj is None: continue
+                if ref_traj is None: 
+                    print("Reference trajectory is None; skipping iteration.")
+                    continue
 
-                self.opti.set_value(self.P_current, self.current_state)
-                self.opti.set_value(self.P_ref, ref_traj)
-
-                # --- IMPROVED WARM START ---
-                # Check if we have a valid previous solution to shift
-                # If we are starting or recovering, we might want to use the linear projection guess
-                
-                # Shift previous solution for warm start
-                # u_prev: [u0, u1, ..., uN-1] -> [u1, ..., uN-1, uN-1]
-                u_guess = np.hstack((self.prev_u_opt[:, 1:], self.prev_u_opt[:, -1:]))
-                
-                # x_prev: [x0, x1, ..., xN] -> [x1, ..., xN, xN] (approximately)
-                # But actually, simpler to just rely on re-solving or linear guess for X if U is good.
-                # Let's try blending: Use shifted U guess, but use current state physics for X guess.
-                
-                # Basic Linear Physics Guess for X (same as before, but good for reliable initialization)
-                curr_x, curr_y, curr_yaw, curr_v = self.current_state
-                x_guess = np.zeros((4, HORIZON + 1))
-                for k in range(HORIZON + 1):
-                    dist = curr_v * DT * k
-                    x_guess[0, k] = curr_x + dist * np.cos(curr_yaw)
-                    x_guess[1, k] = curr_y + dist * np.sin(curr_yaw)
-                    x_guess[2, k] = curr_yaw
-                    x_guess[3, k] = curr_v
-                
-                self.opti.set_initial(self.X_var, x_guess) # Keeping this safe guess
-                self.opti.set_initial(self.U_var, u_guess) # <--- CRITICAL: Use shifted previous controls!
-
-                # Solve
-                sol = self.opti.solve()
+                # Only try a warm start after we have a previous solution.
+                use_warm = (
+                    self.prev_u_opt is not None
+                    and self.prev_x_opt is not None
+                    and np.all(np.isfinite(self.prev_u_opt))
+                    and np.all(np.isfinite(self.prev_x_opt))
+                )
+                sol = self.solve_with_guess(ref_traj, use_prev=use_warm)
+                if sol is None:
+                    # Either warm start failed or we skipped it; always try a cold start next.
+                    sol = self.solve_with_guess(ref_traj, use_prev=False)
+                    if sol is None:
+                        raise RuntimeError("Solver failed after warm and cold starts")
                 
                 u_opt = sol.value(self.U_var)
                 x_opt = sol.value(self.X_var)
@@ -420,10 +530,20 @@ class NeuralMPC:
                 # Update last valid control
                 last_u = [cmd_v, cmd_s]
 
+                # Calculate stats for low-level controller
+                if u_opt.shape[1] > 1:
+                     accel_cmd = (u_opt[0, 1] - u_opt[0, 0]) / DT
+                     steer_rate_cmd = (u_opt[1, 1] - u_opt[1, 0]) / DT
+                else:
+                     accel_cmd = 0.0
+                     steer_rate_cmd = 0.0
+
                 msg = AckermannDrive()
                 # msg.header.stamp = rospy.Time.now()
                 msg.speed = float(cmd_v)
                 msg.steering_angle = float(cmd_s)
+                # msg.acceleration = float(accel_cmd)
+                # msg.steering_angle_velocity = float(steer_rate_cmd)
                 self.pub.publish(msg)
 
             except Exception as e:
@@ -433,13 +553,16 @@ class NeuralMPC:
                 
                 # Often 'Opti' object still has the debug values even if it failed
                 try:
-                    debug_u = self.opti.debug.value(self.U_var)
-                    debug_x = self.opti.debug.value(self.X_var)
-                    self.prev_x_opt = np.array(debug_x) # <--- Force numpy array
-                    
+                    debug_u = np.array(self.opti.debug.value(self.U_var))
+                    debug_x = np.array(self.opti.debug.value(self.X_var))
+                    self.prev_u_opt = debug_u
+                    self.prev_x_opt = debug_x
                     cmd_v = float(debug_u[0, 0])
                     cmd_s = float(debug_u[1, 0])
-                except:
+                except Exception:
+                    # No usable debug info; drop warm-start memory to force cold next loop
+                    self.prev_u_opt = None
+                    self.prev_x_opt = None
                     cmd_v, cmd_s = last_u # Absolute fallback
                 
                 msg = AckermannDrive()
@@ -448,16 +571,19 @@ class NeuralMPC:
                 self.pub.publish(msg)
             
             # Visualize
-            try:
-                self.publish_markers(ref_traj, self.prev_x_opt)
-            except Exception as e:
-                print(f"Viz Error: {e}")
+            if PUBLISH_DEBUG_MARKERS:
+                try:
+                    self.publish_markers(ref_traj, self.prev_x_opt)
+                except Exception as e:
+                    print(f"Viz Error: {e}")
 
             self.rate.sleep()
 
     def publish_markers(self, ref_traj, pred_traj):
         """Publishes Reference (Green) and Predicted (Blue) paths to RViz in LOCAL frame"""
         if self.current_state is None: return
+
+        height = -0.5
 
         # Transform to Local Frame (base_link)
         curr_x, curr_y, curr_yaw, _ = self.current_state
@@ -473,17 +599,20 @@ class NeuralMPC:
             return lx, ly
 
         marker_array = MarkerArray()
+        marker_stamp = rospy.Time(0)  # Use latest TF to avoid RViz flicker when frames lag
 
         # 1. Reference Path Marker
         marker_ref = Marker()
         marker_ref.header.frame_id = "base_link" # <--- CHANGED: Local frame
-        marker_ref.header.stamp = rospy.Time.now()
+        marker_ref.header.stamp = marker_stamp
         marker_ref.ns = "mpc_ref"
         marker_ref.id = 0
-        marker_ref.type = Marker.LINE_STRIP
+        marker_ref.type = Marker.POINTS
         marker_ref.action = Marker.ADD
         marker_ref.pose.orientation.w = 1.0 # <--- Fix: Initialize quaternion
-        marker_ref.scale.x = 0.1 
+        marker_ref.frame_locked = True
+        marker_ref.scale.x = 0.15  # Point width
+        marker_ref.scale.y = 0.15  # Point height
         marker_ref.color.a = 1.0
         marker_ref.color.g = 1.0 # Green
         
@@ -492,19 +621,44 @@ class NeuralMPC:
             p = Point()
             p.x = lx
             p.y = ly
-            p.z = 2.0
+            p.z = height
             marker_ref.points.append(p)
         marker_array.markers.append(marker_ref)
+
+        # Heading arrows for reference path
+        marker_ref_heading = Marker()
+        marker_ref_heading.header.frame_id = "base_link"
+        marker_ref_heading.header.stamp = marker_stamp
+        marker_ref_heading.ns = "mpc_ref_heading"
+        marker_ref_heading.id = 2
+        marker_ref_heading.type = Marker.LINE_LIST
+        marker_ref_heading.action = Marker.ADD
+        marker_ref_heading.pose.orientation.w = 1.0
+        marker_ref_heading.frame_locked = True
+        marker_ref_heading.scale.x = 0.05  # line width
+        marker_ref_heading.color.a = 1.0
+        marker_ref_heading.color.g = 0.8
+        heading_len = 0.6
+        for i in range(ref_traj.shape[1]):
+            yaw = self.wrap_angle(ref_traj[2, i] - curr_yaw)  # rotate heading into local frame
+            lx, ly = global_to_local(ref_traj[0, i], ref_traj[1, i])
+            hx = lx + heading_len * np.cos(yaw)
+            hy = ly + heading_len * np.sin(yaw)
+            start = Point(x=float(lx), y=float(ly), z=height)
+            end = Point(x=float(hx), y=float(hy), z=height)
+            marker_ref_heading.points.extend([start, end])
+        marker_array.markers.append(marker_ref_heading)
 
         # 2. Predicted Path Marker
         marker_pred = Marker()
         marker_pred.header.frame_id = "base_link" 
-        marker_pred.header.stamp = rospy.Time.now()
+        marker_pred.header.stamp = marker_stamp
         marker_pred.ns = "mpc_pred"
         marker_pred.id = 1
         marker_pred.type = Marker.SPHERE_LIST
         marker_pred.action = Marker.ADD
         marker_pred.pose.orientation.w = 1.0 
+        marker_pred.frame_locked = True
         marker_pred.scale.x = 0.1
         marker_pred.scale.y = 0.1
         marker_pred.scale.z = 0.1 
@@ -532,10 +686,39 @@ class NeuralMPC:
             p = Point()
             p.x = float(lx)
             p.y = float(ly)
-            p.z = 2.0
+            p.z = -0.5
             marker_pred.points.append(p)
         
         marker_array.markers.append(marker_pred)
+
+        # Heading arrows for predicted path
+        marker_pred_heading = Marker()
+        marker_pred_heading.header.frame_id = "base_link"
+        marker_pred_heading.header.stamp = marker_stamp
+        marker_pred_heading.ns = "mpc_pred_heading"
+        marker_pred_heading.id = 3
+        marker_pred_heading.type = Marker.LINE_LIST
+        marker_pred_heading.action = Marker.ADD
+        marker_pred_heading.pose.orientation.w = 1.0
+        marker_pred_heading.frame_locked = True
+        marker_pred_heading.scale.x = 0.05
+        marker_pred_heading.color.a = 1.0
+        marker_pred_heading.color.r = 0.8
+        heading_len_pred = 0.6
+        for i in range(pred_traj.shape[1]):
+            if np.isnan(pred_traj[2, i]):
+                continue
+            yaw = float(self.wrap_angle(pred_traj[2, i] - curr_yaw))  # local heading
+            lx, ly = global_to_local(pred_traj[0, i], pred_traj[1, i])
+            if np.isnan(lx) or np.isnan(ly):
+                continue
+            hx = lx + heading_len_pred * np.cos(yaw)
+            hy = ly + heading_len_pred * np.sin(yaw)
+            start = Point(x=float(lx), y=float(ly), z=height)
+            end = Point(x=float(hx), y=float(hy), z=height)
+            marker_pred_heading.points.extend([start, end])
+
+        marker_array.markers.append(marker_pred_heading)
 
         self.vis_pub.publish(marker_array)
 

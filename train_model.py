@@ -25,7 +25,7 @@ LEARNING_RATE = 0.005  # Start with a higher learning rate
 PATIENCE = 100         # How many epochs to wait before lowering LR
 # We train the dynamics to match the controller loop (20 Hz).
 # The raw log was recorded at ~1 kHz, so we resample to ~0.05 s steps.
-TARGET_DT = 0.05
+TARGET_DT = 0.1
 DT_TOL = 0.01  # keep samples whose dt is within +/- this window
 
 # ==========================================
@@ -123,8 +123,28 @@ def load_all_and_process(data_dir: Path):
 
     X_raw = np.vstack(X_list)
     Y_raw = np.vstack(Y_list)
-    print(f"Total samples aggregated: {len(X_raw)} from {len(csv_files)} files")
-    return X_raw, Y_raw
+
+    # --- AUGMENTATION ---
+    # We want the model to know that Left Turn = -Right Turn.
+    # We flip all signs associated with "Y" axis and "Yaw".
+    # X columns: [v, cmd_v, cmd_steer, dt]
+    # Y columns: [dx_local, dy_local, d_yaw, d_v]
+    
+    # Create flipped copy
+    X_flip = X_raw.copy()
+    X_flip[:, 2] *= -1.0  # Flip cmd_steer
+
+    Y_flip = Y_raw.copy()
+    Y_flip[:, 1] *= -1.0  # Flip dy_local
+    Y_flip[:, 2] *= -1.0  # Flip d_yaw
+    
+    # Concatenate original + flipped
+    X_final = np.vstack([X_raw, X_flip])
+    Y_final = np.vstack([Y_raw, Y_flip])
+    
+    print(f"Total samples after augmentation: {len(X_final)} (from {len(X_raw)} original)")
+
+    return X_final, Y_final
 
 # ==========================================
 # 3. IMPROVED NEURAL NETWORK
@@ -133,15 +153,15 @@ class DynamicsModel(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DynamicsModel, self).__init__()
         
-        # Increased capacity (Width and Depth)
+        # Smaller network for faster CasADi graph / MPC solve
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Linear(input_dim, 64),
             nn.Tanh(),
-            nn.Linear(128, 128),
+            nn.Linear(64, 64),
             nn.Tanh(),
-            nn.Linear(128, 64),
+            nn.Linear(64, 32),
             nn.Tanh(),
-            nn.Linear(64, output_dim)
+            nn.Linear(32, output_dim)
         )
 
     def forward(self, x):
