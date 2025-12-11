@@ -7,9 +7,11 @@ import pandas as pd
 import torch
 import casadi as ca
 import pickle
+import time
 from ackermann_msgs.msg import AckermannDrive
 from gazebo_msgs.msg import ModelStates, ModelState
 from gazebo_msgs.srv import SetModelState
+from sensor_msgs.msg import JointState
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
@@ -30,10 +32,12 @@ if 'numpy._core' not in sys.modules:
     sys.modules['numpy._core'] = np.core
 
 # MPC Settings
-HORIZON = 6           # Keep horizon small for faster solve
+HORIZON = 8           # Keep horizon small for faster solve
 PUBLISH_DEBUG_MARKERS = True  # Set True to visualize (adds overhead)
 DT = 0.1              # Time step (Must match your data recorder freq, e.g., 20Hz = 0.05)
 L_WHEELBASE = 1.75     # Meters (approx for Polaris GEM)
+MAX_ACCEL = 2.0        # m/s^2 limit on commanded speed change
+MAX_STEER_RATE = 0.5   # rad/s limit on steering command rate
 
 # CSV Column Mapping (Based on your snippet)
 COL_X = 0
@@ -45,7 +49,7 @@ MAX_REF_V = 5.5       # match controller speed limit
 
 # Look-ahead tuning: shift the target path slightly ahead of the car
 # Fix: Lookahead MUST be > Wheelbase (1.75m) for stability.
-PREVIEW_MIN = 1.0     
+PREVIEW_MIN = 1.5     
 PREVIEW_BASE = 2.0    # Increased from 0.3 to stabilize (Pure Pursuit rule: L > 1.2*Wheelbase)
 PREVIEW_GAIN = 0.5    # Scale with speed
 PREVIEW_MAX = 5.0     
@@ -61,6 +65,9 @@ class NeuralMPC:
         self.initialized = False
         self.prev_u_opt = None
         self.prev_x_opt = None
+        self.steer_actual = float('nan')
+        self._left_idx = None
+        self._right_idx = None
         
         # --- 1. Load Scalers ---
         # We need these to normalize inputs for the neural net inside the solver.
@@ -110,6 +117,7 @@ class NeuralMPC:
         
         # Subscriber for Ground Truth state (Since no Odom/Map frame exists)
         rospy.Subscriber('/gazebo/model_states', ModelStates, self.state_callback)
+        rospy.Subscriber('/gem/joint_states', JointState, self.joint_state_callback)
 
         # --- 6. Teleport to Start ---
         self.teleport_to_start()
@@ -142,9 +150,10 @@ class NeuralMPC:
         # shifting the previous predicted states (which can drift and hurt IPOPT).
         x_guess = np.zeros((4, HORIZON + 1))
         x_guess[:, 0] = [curr_x, curr_y, curr_yaw, curr_v]
+        steer_actual_seq = self.estimate_steering_profile(u_guess)
         temp_state = np.array([curr_x, curr_y, curr_yaw, curr_v], dtype=float)
         for k in range(HORIZON):
-            dx = self.rollout_dynamics_np(temp_state, u_guess[:, k])
+            dx = self.rollout_dynamics_np(temp_state, u_guess[:, k], steer_actual_seq[k])
             temp_state = temp_state + dx
             temp_state[2] = self.wrap_angle(temp_state[2])
             x_guess[:, k + 1] = temp_state
@@ -186,10 +195,19 @@ class NeuralMPC:
         idx = int(np.searchsorted(self.path_s, target_s, side='left'))
         return min(idx, len(self.path_s) - 1)
 
-    def rollout_dynamics_np(self, state, control):
+    def estimate_steering_profile(self, u_seq):
+        """Estimate steer_actual over the horizon using measured step-0 and commanded changes."""
+        steer_cmds = u_seq[1, :]
+        steer_actual_est = np.zeros(HORIZON, dtype=float)
+        steer_actual_est[0] = self.steer_actual if np.isfinite(self.steer_actual) else steer_cmds[0]
+        for k in range(1, HORIZON):
+            steer_actual_est[k] = steer_cmds[k-1]  # assume actuator reaches previous command by next step
+        return steer_actual_est
+
+    def rollout_dynamics_np(self, state, control, steer_actual):
         """Roll the learned dynamics once in numpy for building warm starts."""
         v_actual, v_cmd, steer_cmd = state[3], control[0], control[1]
-        inp = np.array([v_actual, v_cmd, steer_cmd, DT], dtype=float)
+        inp = np.array([v_actual, v_cmd, steer_cmd, steer_actual, DT], dtype=float)
         inp_norm = (inp - self.sx_mean) / self.sx_scale
 
         act = np.tanh
@@ -210,6 +228,8 @@ class NeuralMPC:
             x_guess, u_guess = self.build_initial_guess(ref_traj, use_prev=use_prev)
             self.opti.set_value(self.P_current, self.current_state)
             self.opti.set_value(self.P_ref, ref_traj)
+            steer_act_val = self.steer_actual if np.isfinite(self.steer_actual) else float(u_guess[1, 0])
+            self.opti.set_value(self.P_steer_actual, steer_act_val)
             self.opti.set_initial(self.X_var, x_guess)
             self.opti.set_initial(self.U_var, u_guess)
             return self.opti.solve()
@@ -258,15 +278,16 @@ class NeuralMPC:
         # --- Parameters ---
         self.P_current = opti.parameter(4) # [x, y, yaw, v]
         self.P_ref = opti.parameter(4, HORIZON) # [x, y, yaw, v]
+        self.P_steer_actual = opti.parameter() # measured steering angle at current step
 
         # --- Cost Function Weights (TUNED) ---
-        Q_lat = 10.0    
-        Q_yaw = 20.0     
+        Q_lat = 40.0    
+        Q_yaw = 1.0     
         Q_vel = 5.0 
         R_steer = 1.0    
         R_accel = 1.0 
-        R_dsteer = 150.0 
-        Q_safety = 5.0   
+        R_dsteer = 1.0 
+        Q_safety = 1.0   
 
         cost = 0
         for k in range(HORIZON):
@@ -291,9 +312,9 @@ class NeuralMPC:
             # This encourages low velocity if steering is high, or low steering if velocity is high
             cost += Q_safety * (self.U_var[0, k] * self.U_var[1, k])**2
 
-            if k < HORIZON - 1:
-                # Damping: Penalize rapid changes in steering
-                cost += R_dsteer * (self.U_var[1, k+1] - self.U_var[1, k])**2
+            # if k < HORIZON - 1:
+            #     # Damping: Penalize rapid changes in steering
+            #     cost += R_dsteer * (self.U_var[1, k+1] - self.U_var[1, k])**2
 
         opti.minimize(cost)
 
@@ -305,13 +326,27 @@ class NeuralMPC:
             # Prevent reverse by disallowing negative speed commands
             opti.subject_to(opti.bounded(MIN_REF_V, self.U_var[0, k], MAX_REF_V))
             opti.subject_to(opti.bounded(-0.6, self.U_var[1, k], 0.6))
+            if k > 0:
+                # Rate limits derived from recorded logs (per-step change)
+                opti.subject_to(opti.bounded(-MAX_ACCEL * DT,
+                                             self.U_var[0, k] - self.U_var[0, k-1],
+                                             MAX_ACCEL * DT))
+                opti.subject_to(opti.bounded(-MAX_STEER_RATE * DT,
+                                             self.U_var[1, k] - self.U_var[1, k-1],
+                                             MAX_STEER_RATE * DT))
 
             # --- Neural Network Dynamics (Reconstruction) ---
             state_k = self.X_var[:, k]
             ctrl_k  = self.U_var[:, k]
-            
-            # Input: [v_actual, v_cmd, steer_cmd, dt]
-            input_features = ca.vertcat(state_k[3], ctrl_k[0], ctrl_k[1], DT)
+
+            # Estimate steering actual: use measured for k=0, otherwise assume actuator hits previous command
+            if k == 0:
+                steer_actual_k = self.P_steer_actual
+            else:
+                steer_actual_k = self.U_var[1, k-1]
+
+            # Input: [v_actual, v_cmd, steer_cmd, steer_actual, dt]
+            input_features = ca.vertcat(state_k[3], ctrl_k[0], ctrl_k[1], steer_actual_k, DT)
             inp_norm = (input_features - self.sx_mean) / self.sx_scale
             
             # Use tanh to mirror the training activation (see train_model.py)
@@ -336,7 +371,7 @@ class NeuralMPC:
             # Validation showed the trained model underestimates Yaw Rate by ~6x.
             # Since we cannot retrain, we manually boost the predicted yaw change.
             # This makes the MPC realize the car turns fast, so it commands smoother/smaller steering.
-            YAW_GAIN = 5.0 
+            YAW_GAIN = 6.0 
             out_real[2] = out_real[2] * YAW_GAIN
             
             # Global Frame Update
@@ -355,11 +390,11 @@ class NeuralMPC:
             'print_time': 0, 
             'ipopt.sb': 'yes',
             'ipopt.max_iter': 1000,         
-            'ipopt.max_cpu_time': 0.5,     # seconds
+            'ipopt.max_cpu_time': 1.0,     # seconds (avoid premature timeout)
             'ipopt.hessian_approximation': 'limited-memory', # L-BFGS
-            'ipopt.tol': 1e-2,
-            'ipopt.acceptable_tol': 1e-1,
-            'ipopt.acceptable_obj_change_tol': 1e-3,
+            'ipopt.tol': 1e-1,
+            'ipopt.acceptable_tol': 5e-1,
+            'ipopt.acceptable_obj_change_tol': 1e-2,
             'ipopt.warm_start_init_point': 'yes'
         }
         opti.solver('ipopt', opts)
@@ -386,6 +421,24 @@ class NeuralMPC:
             
         except ValueError:
             print("Model 'gem' or 'polaris' not found in Gazebo ModelStates.")
+
+    def joint_state_callback(self, msg: JointState):
+        """Track measured steering angle and rate from joint states."""
+        try:
+            if self._left_idx is None:
+                self._left_idx = msg.name.index("left_steering_hinge_joint")
+            if self._right_idx is None:
+                self._right_idx = msg.name.index("right_steering_hinge_joint")
+        except ValueError:
+            return
+
+        # Protect against short velocity arrays (some publishers omit velocity)
+        if self._left_idx >= len(msg.position) or self._right_idx >= len(msg.position):
+            return
+        left_theta = msg.position[self._left_idx]
+        right_theta = msg.position[self._right_idx]
+
+        self.steer_actual = 0.5 * (left_theta + right_theta)
 
     def teleport_to_start(self):
         """Teleports the car to the first waypoint and resets controls"""
@@ -498,7 +551,10 @@ class NeuralMPC:
                 continue
                 
             try:
+                # start_time = time.time()
                 ref_traj = self.get_reference_trajectory()
+                # end_time = time.time()
+                # print(f"Reference trajectory generation time: {end_time - start_time:.2f} seconds")
                 if ref_traj is None: 
                     print("Reference trajectory is None; skipping iteration.")
                     continue
@@ -510,7 +566,10 @@ class NeuralMPC:
                     and np.all(np.isfinite(self.prev_u_opt))
                     and np.all(np.isfinite(self.prev_x_opt))
                 )
+                # start_time = time.time()
                 sol = self.solve_with_guess(ref_traj, use_prev=use_warm)
+                # end_time = time.time()
+                # print(f"Solver time: {end_time - start_time:.2f} seconds")
                 if sol is None:
                     # Either warm start failed or we skipped it; always try a cold start next.
                     sol = self.solve_with_guess(ref_traj, use_prev=False)
@@ -530,20 +589,10 @@ class NeuralMPC:
                 # Update last valid control
                 last_u = [cmd_v, cmd_s]
 
-                # Calculate stats for low-level controller
-                if u_opt.shape[1] > 1:
-                     accel_cmd = (u_opt[0, 1] - u_opt[0, 0]) / DT
-                     steer_rate_cmd = (u_opt[1, 1] - u_opt[1, 0]) / DT
-                else:
-                     accel_cmd = 0.0
-                     steer_rate_cmd = 0.0
-
                 msg = AckermannDrive()
                 # msg.header.stamp = rospy.Time.now()
                 msg.speed = float(cmd_v)
                 msg.steering_angle = float(cmd_s)
-                # msg.acceleration = float(accel_cmd)
-                # msg.steering_angle_velocity = float(steer_rate_cmd)
                 self.pub.publish(msg)
 
             except Exception as e:

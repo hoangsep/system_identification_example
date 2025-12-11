@@ -47,9 +47,9 @@ class ModelValidator:
                 print(f"Failed to load scalers: {e2}")
                 sys.exit(1)
 
-    def predict(self, v_actual, v_cmd, steer_cmd, dt=DT):
-        # Input: [v_actual, v_cmd, steer_cmd, dt]
-        inp = np.array([v_actual, v_cmd, steer_cmd, dt], dtype=float)
+    def predict(self, v_actual, v_cmd, steer_cmd, steer_actual, dt=DT):
+        # Input: [v_actual, v_cmd, steer_cmd, steer_actual, dt]
+        inp = np.array([v_actual, v_cmd, steer_cmd, steer_actual, dt], dtype=float)
         inp_norm = (inp - self.sx_mean) / self.sx_scale
 
         # Forward Pass (Tanh activations)
@@ -111,7 +111,7 @@ class ModelValidator:
 
         # Test 1: Stopped
         print("\nTest 1: STOPPED")
-        res = self.predict(0, 0, 0, dt)
+        res = self.predict(0, 0, 0, 0, dt)
         if abs(res[0]) < 0.01 and abs(res[2]) < 0.001:
             print("[PASS] Stationary")
         else:
@@ -120,7 +120,7 @@ class ModelValidator:
 
         # Test 2: Straight
         print("\nTest 2: STRAIGHT (v=1.0, steer=0.0)")
-        res = self.predict(1.0, 1.0, 0.0, dt)
+        res = self.predict(1.0, 1.0, 0.0, 0.0, dt)
         k_dx, k_dy, k_yaw = self.expected_kinematic(1.0, 0.0, dt)
         # Check Speed
         if self.check("Longitudinal Motion", res[0], k_dx, tol_sign=True, min_mag_ratio=0.8):
@@ -137,7 +137,7 @@ class ModelValidator:
         # Test 3: Hard Left
         steer = 0.5
         print(f"\nTest 3: HARD LEFT (v=1.0, steer={steer})")
-        res = self.predict(1.0, 1.0, steer, dt)
+        res = self.predict(1.0, 1.0, steer, steer, dt)
         k_dx, k_dy, k_yaw = self.expected_kinematic(1.0, steer, dt)
         print(f"       Model: d_yaw={res[2]:.4f} | Kinematic: {k_yaw:.4f}")
         
@@ -147,7 +147,7 @@ class ModelValidator:
         # Test 4: Hard Right
         steer = -0.5
         print(f"\nTest 4: HARD RIGHT (v=1.0, steer={steer})")
-        res = self.predict(1.0, 1.0, steer, dt)
+        res = self.predict(1.0, 1.0, steer, steer, dt)
         _, _, k_yaw = self.expected_kinematic(1.0, steer, dt)
         print(f"       Model: d_yaw={res[2]:.4f} | Kinematic: {k_yaw:.4f}")
         
