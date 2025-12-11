@@ -12,7 +12,7 @@ from sklearn.preprocessing import StandardScaler
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-DATA_DIR = Path('data')  # train on all CSVs in this folder
+DATA_DIR = Path('neo_data')  # train on all CSVs in this folder
 MODEL_SAVE_PATH = 'gem_dynamics.pth'
 SCALER_SAVE_PATH = 'gem_scaler.pkl'
 SCALER_ARRAY_PATH = 'gem_scaler_arrays.npz'
@@ -35,6 +35,12 @@ def load_and_process_data(filename):
     print(f"Loading data from {filename}...")
     df = pd.read_csv(filename)
 
+    # Ensure new required columns are present
+    required_cols = ['steer_actual']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{filename} is missing required columns: {missing}. Re-record data with steer_actual.")
+
     # Raw logs were collected at ~1 kHz. Pick a stride so that the "next"
     # sample is roughly TARGET_DT away from the current one.
     raw_dt = df['time'].diff().dropna()
@@ -56,11 +62,32 @@ def load_and_process_data(filename):
         (dt < TARGET_DT + DT_TOL) &
         (df['v_actual'].values > 0.05)
     )
-    
+
     # Apply filtering
     df = df[mask].reset_index(drop=True)
     df_next = df_next[mask].reset_index(drop=True)
     dt = dt[mask]
+
+    # Drop any rows with NaN/inf in features or targets to prevent NaN loss
+    finite_mask = (
+        np.isfinite(df[['v_actual', 'cmd_speed', 'cmd_steer', 'steer_actual', 'x', 'y', 'yaw']]).all(axis=1) &
+        np.isfinite(df_next[['x', 'y', 'yaw', 'v_actual']]).all(axis=1) &
+        np.isfinite(dt)
+    )
+    if not finite_mask.all():
+        removed = (~finite_mask).sum()
+        bad_rows = df.loc[~finite_mask, ['time', 'v_actual', 'cmd_speed', 'cmd_steer',
+                                         'steer_actual', 'x', 'y', 'yaw']].copy()
+        bad_rows['dt'] = dt[~finite_mask]
+        bad_rows['next_x'] = df_next.loc[~finite_mask, 'x'].values
+        bad_rows['next_y'] = df_next.loc[~finite_mask, 'y'].values
+        bad_rows['next_yaw'] = df_next.loc[~finite_mask, 'yaw'].values
+        bad_rows['next_v'] = df_next.loc[~finite_mask, 'v_actual'].values
+        print(f"  - Dropping {removed} rows with NaN/inf after filtering. Problem rows:")
+        print(bad_rows.to_string(index=False))
+    df = df[finite_mask].reset_index(drop=True)
+    df_next = df_next[finite_mask].reset_index(drop=True)
+    dt = dt[finite_mask]
 
     if len(df) == 0:
         raise ValueError(f"No usable samples in {filename} after resampling/filtering")
@@ -69,12 +96,13 @@ def load_and_process_data(filename):
 
 
     # --- 1. INPUTS (Features) ---
-    # [v_current, cmd_speed, cmd_steer, dt]
+    # [v_current, cmd_speed, cmd_steer, steer_actual, dt]
     # Adding 'dt' is CRITICAL so the model learns Physics (Dist = Vel * Time)
     X = np.column_stack([
         df['v_actual'].values,
         df['cmd_speed'].values,
         df['cmd_steer'].values,
+        df['steer_actual'].values,
         dt
     ])
 
@@ -127,12 +155,13 @@ def load_all_and_process(data_dir: Path):
     # --- AUGMENTATION ---
     # We want the model to know that Left Turn = -Right Turn.
     # We flip all signs associated with "Y" axis and "Yaw".
-    # X columns: [v, cmd_v, cmd_steer, dt]
+    # X columns: [v, cmd_v, cmd_steer, steer_actual, dt]
     # Y columns: [dx_local, dy_local, d_yaw, d_v]
     
     # Create flipped copy
     X_flip = X_raw.copy()
     X_flip[:, 2] *= -1.0  # Flip cmd_steer
+    X_flip[:, 3] *= -1.0  # Flip steer_actual
 
     Y_flip = Y_raw.copy()
     Y_flip[:, 1] *= -1.0  # Flip dy_local
@@ -205,9 +234,9 @@ if __name__ == "__main__":
     Y_test_t = torch.tensor(Y_test, dtype=torch.float32, device=device)
 
     # --- Initialize Model ---
-    # Input Dim = 4 (v, cmd_v, cmd_s, dt)
+    # Input Dim = 5 (v, cmd_v, cmd_s, steer_actual, dt)
     # Output Dim = 4 (dx, dy, dtheta, dv)
-    model = DynamicsModel(input_dim=4, output_dim=4).to(device)
+    model = DynamicsModel(input_dim=5, output_dim=4).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()

@@ -10,7 +10,7 @@ X, Y = sx.transform(X_raw), sy.transform(Y_raw)
 _, X_test, _, Y_test = train_test_split(X, Y, test_size=0.2, random_state=42)
 
 # Load model
-m = tm.DynamicsModel(4,4)
+m = tm.DynamicsModel(5,4)
 m.load_state_dict(torch.load(tm.MODEL_SAVE_PATH, map_location='cpu'))
 m.eval()
 

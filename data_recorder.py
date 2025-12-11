@@ -4,6 +4,7 @@ import pandas as pd
 import math
 from gazebo_msgs.msg import ModelStates
 from ackermann_msgs.msg import AckermannDrive
+from sensor_msgs.msg import JointState
 from tf.transformations import euler_from_quaternion
 
 class DataRecorder:
@@ -11,16 +12,21 @@ class DataRecorder:
         rospy.init_node('data_recorder', anonymous=True)
         
         # Configuration
-        self.robot_name = "gem" # CHECK THIS: Might be "polaris" or "gem"
+        self.robot_name = "gem" 
         self.data = []
         
         # State variables
         self.current_cmd_speed = 0.0
         self.current_cmd_steer = 0.0
+        self.steer_actual = math.nan
+        self.steer_rate = math.nan
+        self._left_idx = None
+        self._right_idx = None
         
         # Subscribers
         rospy.Subscriber("/gem/ackermann_cmd", AckermannDrive, self.cmd_callback)
         rospy.Subscriber("/gazebo/model_states", ModelStates, self.state_callback)
+        rospy.Subscriber("/gem/joint_states", JointState, self.joint_state_callback)
         
         print("Recorder started. Driving data will be saved on shutdown...")
 
@@ -29,11 +35,33 @@ class DataRecorder:
         self.current_cmd_speed = msg.speed
         self.current_cmd_steer = msg.steering_angle
 
+    def joint_state_callback(self, msg: JointState):
+        # Lazily cache the joint indices once we see them
+        try:
+            if self._left_idx is None:
+                self._left_idx = msg.name.index("left_steering_hinge_joint")
+            if self._right_idx is None:
+                self._right_idx = msg.name.index("right_steering_hinge_joint")
+        except ValueError:
+            # Joint names not present in this message
+            print("Joint names not present in this message")
+            return
+
+        left_theta = msg.position[self._left_idx] if len(msg.position) > self._left_idx else 0.0
+        right_theta = msg.position[self._right_idx] if len(msg.position) > self._right_idx else 0.0
+        left_rate = msg.velocity[self._left_idx] if len(msg.velocity) > self._left_idx else 0.0
+        right_rate = msg.velocity[self._right_idx] if len(msg.velocity) > self._right_idx else 0.0
+
+        # Use the average of left/right steering joints as the actual steering angle
+        self.steer_actual = 0.5 * (left_theta + right_theta)
+        self.steer_rate = 0.5 * (left_rate + right_rate)
+
     def state_callback(self, msg):
         try:
             # Find the index of our robot
             idx = msg.name.index(self.robot_name)
         except ValueError:
+            print("Robot name not present in this message")
             return
 
         # Extract Position
@@ -56,6 +84,8 @@ class DataRecorder:
             'time': rospy.get_time(),
             'cmd_speed': self.current_cmd_speed,
             'cmd_steer': self.current_cmd_steer,
+            'steer_actual': self.steer_actual,
+            'steer_rate': self.steer_rate,
             'x': p.x,
             'y': p.y,
             'yaw': yaw,
