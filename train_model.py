@@ -12,21 +12,24 @@ from sklearn.preprocessing import StandardScaler
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-DATA_DIR = Path('neo_data')  # train on all CSVs in this folder
+DATA_DIR = Path('neo_data')
 MODEL_SAVE_PATH = 'gem_dynamics.pth'
 SCALER_SAVE_PATH = 'gem_scaler.pkl'
 SCALER_ARRAY_PATH = 'gem_scaler_arrays.npz'
 PLOT_SAVE_PATH = 'sysid_validation_plot.png'
 
 # Training Hyperparameters
-EPOCHS = 8000          # Increased epochs since we have a scheduler
-BATCH_SIZE = 128       # Larger batch size for stability
-LEARNING_RATE = 0.005  # Start with a higher learning rate
-PATIENCE = 100         # How many epochs to wait before lowering LR
-# We train the dynamics to match the controller loop (20 Hz).
-# The raw log was recorded at ~1 kHz, so we resample to ~0.05 s steps.
-TARGET_DT = 0.1
-DT_TOL = 0.01  # keep samples whose dt is within +/- this window
+EPOCHS = 8000
+BATCH_SIZE = 128
+LEARNING_RATE = 0.005
+PATIENCE = 150 # Increased patience for weighted optimization
+
+# Weighting Factor: How much more important is a turn than a straight line?
+TURN_WEIGHT_FACTOR = 20.0 
+
+# Controller Loop Settings
+TARGET_DT = 0.05
+DT_TOL = 0.01
 
 # ==========================================
 # 2. DATA PREPROCESSING
@@ -35,102 +38,76 @@ def load_and_process_data(filename):
     print(f"Loading data from {filename}...")
     df = pd.read_csv(filename)
 
-    # Ensure new required columns are present
-    required_cols = ['steer_actual']
+    required_cols = ['time', 'cmd_speed', 'cmd_steer', 'steer_actual', 
+                     'x', 'y', 'yaw', 'v_actual', 'yaw_rate']
+    
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"{filename} is missing required columns: {missing}. Re-record data with steer_actual.")
+        raise ValueError(f"{filename} is missing: {missing}")
 
-    # Raw logs were collected at ~1 kHz. Pick a stride so that the "next"
-    # sample is roughly TARGET_DT away from the current one.
+    # Resample / Stride Calculation
     raw_dt = df['time'].diff().dropna()
     median_raw_dt = raw_dt.median()
+    if median_raw_dt <= 0 or np.isnan(median_raw_dt):
+        print(f"Skipping {filename}: Invalid time deltas.")
+        return np.array([]), np.array([])
+
     stride = max(1, int(round(TARGET_DT / median_raw_dt)))
-    print(f"Median raw dt: {median_raw_dt:.4f}s, stride: {stride} -> target ~{TARGET_DT:.3f}s")
+    print(f"  -> Raw dt: {median_raw_dt:.4f}s, Stride: {stride} (Target {TARGET_DT}s)")
     
-    # Create "Next State" columns by shifting the dataframe up by the stride
-    df_next = df.shift(-stride)
+    # Create 'Next' DataFrame (State t+1)
+    df_curr = df.iloc[:-stride].reset_index(drop=True)
+    df_next = df.shift(-stride).iloc[:-stride].reset_index(drop=True)
     
-    # Calculate dt (Time step) and drop the last `stride` rows (NaN due to shift)
-    df = df.iloc[:-stride]
-    df_next = df_next.iloc[:-stride]
-    dt = df_next['time'].values - df['time'].values
-    
-    # Keep samples that match the controller loop timing and avoid bad data
+    # Filter by DT validity and minimal movement
+    dt = df_next['time'].values - df_curr['time'].values
     mask = (
-        (dt > TARGET_DT - DT_TOL) &
-        (dt < TARGET_DT + DT_TOL) &
-        (df['v_actual'].values > 0.05)
+        (dt > TARGET_DT - DT_TOL) & 
+        (dt < TARGET_DT + DT_TOL) & 
+        (df_curr['v_actual'].values > 0.01)
     )
 
-    # Apply filtering
-    df = df[mask].reset_index(drop=True)
+    df_curr = df_curr[mask].reset_index(drop=True)
     df_next = df_next[mask].reset_index(drop=True)
     dt = dt[mask]
 
-    # Drop any rows with NaN/inf in features or targets to prevent NaN loss
-    finite_mask = (
-        np.isfinite(df[['v_actual', 'cmd_speed', 'cmd_steer', 'steer_actual', 'x', 'y', 'yaw']]).all(axis=1) &
-        np.isfinite(df_next[['x', 'y', 'yaw', 'v_actual']]).all(axis=1) &
-        np.isfinite(dt)
-    )
-    if not finite_mask.all():
-        removed = (~finite_mask).sum()
-        bad_rows = df.loc[~finite_mask, ['time', 'v_actual', 'cmd_speed', 'cmd_steer',
-                                         'steer_actual', 'x', 'y', 'yaw']].copy()
-        bad_rows['dt'] = dt[~finite_mask]
-        bad_rows['next_x'] = df_next.loc[~finite_mask, 'x'].values
-        bad_rows['next_y'] = df_next.loc[~finite_mask, 'y'].values
-        bad_rows['next_yaw'] = df_next.loc[~finite_mask, 'yaw'].values
-        bad_rows['next_v'] = df_next.loc[~finite_mask, 'v_actual'].values
-        print(f"  - Dropping {removed} rows with NaN/inf after filtering. Problem rows:")
-        print(bad_rows.to_string(index=False))
-    df = df[finite_mask].reset_index(drop=True)
-    df_next = df_next[finite_mask].reset_index(drop=True)
-    dt = dt[finite_mask]
+    if len(df_curr) == 0:
+        return np.array([]), np.array([])
 
-    if len(df) == 0:
-        raise ValueError(f"No usable samples in {filename} after resampling/filtering")
-
-    print(f"Data count after filtering: {len(df)} samples (dt mean {dt.mean():.4f}s, std {dt.std():.4f}s)")
-
-
-    # --- 1. INPUTS (Features) ---
-    # [v_current, cmd_speed, cmd_steer, steer_actual, dt]
-    # Adding 'dt' is CRITICAL so the model learns Physics (Dist = Vel * Time)
+    # --- Inputs (Features) ---
+    # [v, steer_actual, yaw_rate, cmd_speed, cmd_steer, dt]
     X = np.column_stack([
-        df['v_actual'].values,
-        df['cmd_speed'].values,
-        df['cmd_steer'].values,
-        df['steer_actual'].values,
-        dt
+        df_curr['v_actual'].values,      # 0
+        df_curr['steer_actual'].values,  # 1
+        df_curr['yaw_rate'].values,      # 2
+        df_curr['cmd_speed'].values,     # 3
+        df_curr['cmd_steer'].values,     # 4
+        dt                               # 5
     ])
 
-    # --- 2. OUTPUTS (Targets) ---
-    # We predict the CHANGE in state (Delta), not the absolute position
+    # --- Outputs (Targets) ---
+    # [dx_local, dy_local, d_yaw, d_v, d_steer]
     
-    # Calculate Global Deltas
-    dx_global = df_next['x'].values - df['x'].values
-    dy_global = df_next['y'].values - df['y'].values
-    yaw = df['yaw'].values
+    # Global Deltas
+    dx_global = df_next['x'].values - df_curr['x'].values
+    dy_global = df_next['y'].values - df_curr['y'].values
+    yaw_curr = df_curr['yaw'].values
 
-    # Rotate Global Deltas into Local Frame
-    # Because the physics of the car are the same whether it's at x=0 or x=100
-    dx_local = np.cos(yaw) * dx_global + np.sin(yaw) * dy_global
-    dy_local = -np.sin(yaw) * dx_global + np.cos(yaw) * dy_global
+    # Rotate to Local Frame
+    dx_local = np.cos(yaw_curr) * dx_global + np.sin(yaw_curr) * dy_global
+    dy_local = -np.sin(yaw_curr) * dx_global + np.cos(yaw_curr) * dy_global
     
-    # Calculate Yaw Delta (handle -pi to pi wrap-around)
-    d_yaw = df_next['yaw'].values - df['yaw'].values
+    # Delta Yaw (wrapped)
+    d_yaw = df_next['yaw'].values - df_curr['yaw'].values
     d_yaw = np.arctan2(np.sin(d_yaw), np.cos(d_yaw))
     
-    # Calculate Velocity Delta
-    d_v = df_next['v_actual'].values - df['v_actual'].values
+    d_v = df_next['v_actual'].values - df_curr['v_actual'].values
+    d_steer = df_next['steer_actual'].values - df_curr['steer_actual'].values
 
-    # Target Vector: [dx_local, dy_local, d_yaw, d_v]
-    Y = np.column_stack([dx_local, dy_local, d_yaw, d_v])
+    Y = np.column_stack([dx_local, dy_local, d_yaw, d_v, d_steer])
     
-    return X, Y
-
+    valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(Y).all(axis=1)
+    return X[valid_mask], Y[valid_mask]
 
 def load_all_and_process(data_dir: Path):
     csv_files = sorted(Path(data_dir).glob("*.csv"))
@@ -140,49 +117,49 @@ def load_all_and_process(data_dir: Path):
     X_list, Y_list = [], []
     for csv_file in csv_files:
         X_part, Y_part = load_and_process_data(csv_file)
-        if len(X_part) == 0:
-            print(f"Skipping {csv_file} (no samples after filtering)")
-            continue
-        X_list.append(X_part)
-        Y_list.append(Y_part)
+        if len(X_part) > 0:
+            X_list.append(X_part)
+            Y_list.append(Y_part)
 
     if not X_list:
-        raise ValueError("No samples remained after filtering any CSV files.")
+        raise ValueError("No valid data found.")
 
     X_raw = np.vstack(X_list)
     Y_raw = np.vstack(Y_list)
 
-    # --- AUGMENTATION ---
-    # We want the model to know that Left Turn = -Right Turn.
-    # We flip all signs associated with "Y" axis and "Yaw".
-    # X columns: [v, cmd_v, cmd_steer, steer_actual, dt]
-    # Y columns: [dx_local, dy_local, d_yaw, d_v]
-    
-    # Create flipped copy
-    X_flip = X_raw.copy()
-    X_flip[:, 2] *= -1.0  # Flip cmd_steer
-    X_flip[:, 3] *= -1.0  # Flip steer_actual
+    print(f"Total raw samples: {len(X_raw)}")
+    return X_raw, Y_raw
 
-    Y_flip = Y_raw.copy()
-    Y_flip[:, 1] *= -1.0  # Flip dy_local
-    Y_flip[:, 2] *= -1.0  # Flip d_yaw
-    
-    # Concatenate original + flipped
-    X_final = np.vstack([X_raw, X_flip])
-    Y_final = np.vstack([Y_raw, Y_flip])
-    
-    print(f"Total samples after augmentation: {len(X_final)} (from {len(X_raw)} original)")
+def mirror_augment(X: np.ndarray, Y: np.ndarray):
+    """
+    Left/right mirroring in the vehicle (local/body) frame.
 
-    return X_final, Y_final
+    Inputs:  [v, steer_actual, yaw_rate, cmd_speed, cmd_steer, dt]
+    Targets: [dx_local, dy_local, d_yaw, d_v, d_steer]
+    """
+    if X.size == 0 or Y.size == 0:
+        return X, Y
+
+    X_flip = X.copy()
+    X_flip[:, 1] *= -1.0  # steer_actual
+    X_flip[:, 2] *= -1.0  # yaw_rate
+    X_flip[:, 4] *= -1.0  # cmd_steer
+
+    Y_flip = Y.copy()
+    Y_flip[:, 1] *= -1.0  # dy_local
+    Y_flip[:, 2] *= -1.0  # d_yaw
+    Y_flip[:, 4] *= -1.0  # d_steer
+
+    X_aug = np.vstack([X, X_flip])
+    Y_aug = np.vstack([Y, Y_flip])
+    return X_aug, Y_aug
 
 # ==========================================
-# 3. IMPROVED NEURAL NETWORK
+# 3. MODEL ARCHITECTURE
 # ==========================================
 class DynamicsModel(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DynamicsModel, self).__init__()
-        
-        # Smaller network for faster CasADi graph / MPC solve
         self.net = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.Tanh(),
@@ -197,125 +174,165 @@ class DynamicsModel(nn.Module):
         return self.net(x)
 
 # ==========================================
-# 4. MAIN EXECUTION
+# 4. TRAINING ROUTINE
 # ==========================================
 if __name__ == "__main__":
-    # --- Device ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Load Data ---
+    # 1. Load Data
     X_raw, Y_raw = load_all_and_process(DATA_DIR)
 
-    # --- Normalize Data ---
-    # Neural Networks fail if inputs are 20.0 and 0.001 mixed together.
+    # 2. Split FIRST (avoid test leakage via augmentation/scaling)
+    X_train_raw, X_test_raw, Y_train_raw, Y_test_raw = train_test_split(
+        X_raw, Y_raw, test_size=0.2, random_state=42
+    )
+
+    # 3. Augment ONLY the training set (mirroring)
+    X_train_raw, Y_train_raw = mirror_augment(X_train_raw, Y_train_raw)
+    print(f"Train samples (after augmentation): {len(X_train_raw)} | Test samples: {len(X_test_raw)}")
+
+    # 4. Scale using TRAIN statistics only
     scaler_x = StandardScaler()
     scaler_y = StandardScaler()
     
-    X_scaled = scaler_x.fit_transform(X_raw)
-    Y_scaled = scaler_y.fit_transform(Y_raw)
+    X_train = scaler_x.fit_transform(X_train_raw)
+    Y_train = scaler_y.fit_transform(Y_train_raw)
+    X_test = scaler_x.transform(X_test_raw)
+    Y_test = scaler_y.transform(Y_test_raw)
 
-    # Save scalers for the MPC controller later
     with open(SCALER_SAVE_PATH, 'wb') as f:
         pickle.dump({'x': scaler_x, 'y': scaler_y}, f)
-        print(f"Scalers saved to {SCALER_SAVE_PATH}")
+    
     np.savez(SCALER_ARRAY_PATH,
              x_mean=scaler_x.mean_, x_scale=scaler_x.scale_,
              y_mean=scaler_y.mean_, y_scale=scaler_y.scale_)
-    print(f"Scaler arrays saved to {SCALER_ARRAY_PATH}")
+    print("Scalers saved.")
 
-    # Split Train/Test
-    X_train, X_test, Y_train, Y_test = train_test_split(X_scaled, Y_scaled, test_size=0.2, random_state=42)
-
-    # Convert to PyTorch Tensors on the chosen device
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32, device=device)
     X_test_t = torch.tensor(X_test, dtype=torch.float32, device=device)
     Y_test_t = torch.tensor(Y_test, dtype=torch.float32, device=device)
 
-    # --- Initialize Model ---
-    # Input Dim = 5 (v, cmd_v, cmd_s, steer_actual, dt)
-    # Output Dim = 4 (dx, dy, dtheta, dv)
-    model = DynamicsModel(input_dim=5, output_dim=4).to(device)
+    # =========================================================
+    # 4. WEIGHT CALCULATION (Fixing the Imbalance)
+    # =========================================================
+    # We use the scaled d_yaw (Index 2 in Y) as a proxy for turn intensity.
+    # Since it's scaled, values > 1.0 are significant turns.
     
+    print("Calculating Sample Weights...")
+    # Calculate absolute magnitude of the turn in the training set
+    turn_intensity = torch.abs(Y_train_t[:, 2]) 
+    
+    # Weight = 1.0 (Base) + Factor * Intensity
+    # If d_yaw is 0 (Straight), Weight = 1.0
+    # If d_yaw is 2 sigma (Sharp Turn), Weight = 1.0 + 20 * 2 = 41.0
+    train_weights = 1.0 + (TURN_WEIGHT_FACTOR * turn_intensity)
+    
+    # Normalize weights so the mean is 1.0 (keeps learning rate consistent)
+    train_weights = train_weights / train_weights.mean()
+    train_weights = train_weights.unsqueeze(1) # [Batch, 1] for broadcasting
+    
+    print(f"  -> Min Weight: {train_weights.min().item():.2f}")
+    print(f"  -> Max Weight: {train_weights.max().item():.2f}")
+
+    # 5. Init Model
+    model = DynamicsModel(input_dim=6, output_dim=5).to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    criterion = nn.MSELoss()
     
-    # Scheduler: Reduce LR if validation loss doesn't improve
+    # Important: reduction='none' so we can apply weights element-wise
+    criterion_raw = nn.MSELoss(reduction='none') 
+    
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=PATIENCE, min_lr=1e-5
+        optimizer, mode='min', factor=0.5, patience=PATIENCE, min_lr=1e-6
     )
 
-    # --- Training Loop ---
-    print("\nStarting Training...")
-    train_losses = []
-    val_losses = []
-
+    # 6. Train
+    print("\nStarting Training with Weighted Loss...")
     for epoch in range(EPOCHS):
         model.train()
         optimizer.zero_grad()
+        
         output = model(X_train_t)
-        loss = criterion(output, Y_train_t)
-        loss.backward()
+        
+        # Calculate element-wise loss [Batch, 5]
+        loss_elements = criterion_raw(output, Y_train_t)
+        
+        # Apply weights across all output dimensions for each sample
+        # (We weight the whole sample based on how hard the turn is)
+        loss_weighted = (loss_elements * train_weights).mean()
+        
+        loss_weighted.backward()
         optimizer.step()
         
-        # Validation
         model.eval()
         with torch.no_grad():
             val_out = model(X_test_t)
-            val_loss = criterion(val_out, Y_test_t)
+            # Use standard MSE for validation to track true error
+            val_loss = nn.MSELoss()(val_out, Y_test_t)
             
-        # Update Scheduler
         scheduler.step(val_loss)
-
-        train_losses.append(loss.item())
-        val_losses.append(val_loss.item())
         
         if epoch % 100 == 0:
-            lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch}: Train Loss {loss.item():.5f}, Val Loss {val_loss.item():.5f}, LR {lr:.6f}")
-            
-            # Early stopping check (optional manually)
-            if val_loss.item() < 0.005: 
-                print("Converged! Stopping early.")
+            print(f"Epoch {epoch}: Train (Weighted) {loss_weighted.item():.5f}, Val (Raw) {val_loss.item():.5f}, LR {optimizer.param_groups[0]['lr']:.6f}")
+            if val_loss.item() < 0.0025 and optimizer.param_groups[0]['lr'] < 1e-4:
+                print("Converged.")
                 break
 
-    # --- Save Model ---
     torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"\nModel saved to {MODEL_SAVE_PATH}")
+    print(f"Model saved to {MODEL_SAVE_PATH}")
 
-    # --- Evaluation & Plotting ---
+    # =========================================================
+    # 7. EVALUATION (The True Test)
+    # =========================================================
     model.eval()
     with torch.no_grad():
-        predicted_scaled = model(X_test_t).detach().cpu().numpy()
+        pred_scaled = model(X_test_t).detach().cpu().numpy()
     
-    # Inverse transform to get real physical units
-    predicted_real = scaler_y.inverse_transform(predicted_scaled)
+    pred_real = scaler_y.inverse_transform(pred_scaled)
     actual_real = scaler_y.inverse_transform(Y_test)
 
-    # Calculate RMSE
-    rmse = np.sqrt(np.mean((actual_real - predicted_real)**2, axis=0))
-    print("\n=== Model Accuracy (RMSE) ===")
-    print(f"dX (local): {rmse[0]:.4f} m")
-    print(f"dY (local): {rmse[1]:.4f} m")
-    print(f"dYaw:      {rmse[2]:.4f} rad")
-    print(f"dV:        {rmse[3]:.4f} m/s")
+    # Metric 1: Global RMSE
+    rmse_global = np.sqrt(np.mean((actual_real - pred_real)**2, axis=0))
+    
+    # Metric 2: TURN RMSE (The important one!)
+    # Define a turn as yaw_rate > 0.1 rad/s (approx 6 deg/s)
+    # Note: We look at the actual physical YAW RATE (from input X, which we need to recover or infer)
+    # Easier way: Look at Y_test (d_yaw).
+    
+    # Recover unscaled d_yaw for the test set
+    d_yaw_test_real = actual_real[:, 2]
+    
+    # Define threshold for "Turning"
+    # 0.1 rad/s * 0.05s = 0.005 rad change per step
+    turn_mask = np.abs(d_yaw_test_real) > 0.005 
+    
+    print("\n=== EVALUATION RESULTS ===")
+    print(f"Global RMSE (dYaw):  {rmse_global[2]:.5f} rad")
+    
+    if np.sum(turn_mask) > 0:
+        rmse_turn = np.sqrt(np.mean((actual_real[turn_mask] - pred_real[turn_mask])**2, axis=0))
+        print(f"TURN RMSE (dYaw):    {rmse_turn[2]:.5f} rad  <-- THIS MUST BE LOW")
+        print(f"TURN RMSE (dLat):    {rmse_turn[1]:.5f} m")
+    else:
+        print("No turns found in test set to evaluate.")
 
-    # Plot Results
-    plt.figure(figsize=(14, 10))
-    labels = ['Delta X (Local)', 'Delta Y (Local)', 'Delta Yaw', 'Delta Velocity']
+    # Plot
+    plt.figure(figsize=(15, 10))
     
-    # Only plot first 150 points to make the graph readable
-    limit = 150 
+    # Sort by turning magnitude for cleaner plotting
+    sort_idx = np.argsort(d_yaw_test_real)
     
-    for i in range(4):
-        plt.subplot(2, 2, i+1)
-        plt.plot(actual_real[:limit, i], label='Actual', color='black', alpha=0.6)
-        plt.plot(predicted_real[:limit, i], label='Predicted', color='red', alpha=0.7, linestyle='--')
-        plt.title(f"{labels[i]} - RMSE: {rmse[i]:.4f}")
+    labels = ['dX', 'dY', 'dYaw', 'dV', 'dSteer']
+    for i in range(5):
+        plt.subplot(2, 3, i+1)
+        # Plot only a subset of sorted data to see the "S" curve of prediction
+        plt.plot(actual_real[sort_idx, i], label='Actual', color='black', alpha=0.6)
+        plt.plot(pred_real[sort_idx, i], label='Pred', color='red', alpha=0.6)
+        plt.title(labels[i])
         plt.legend()
         plt.grid(True)
-
+        
     plt.tight_layout()
     plt.savefig(PLOT_SAVE_PATH)
-    print(f"Validation plot saved as {PLOT_SAVE_PATH}")
+    print(f"Plot saved to {PLOT_SAVE_PATH}")

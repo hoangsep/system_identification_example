@@ -1,1 +1,13 @@
 __pycache__/
+
+# Acados generated files
+*.so
+*.o
+*_cost/
+*_model/
+acados_solver_*.c
+acados_solver_*.h
+acados_sim_*.c
+acados_sim_*.h
+c_generated_code/
+*.json
