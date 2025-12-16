@@ -8,6 +8,10 @@ import torch
 import casadi as ca
 import pickle
 import time
+try:
+    from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel, get_tera
+except ImportError:  # acados not installed in some environments
+    AcadosOcp = AcadosOcpSolver = AcadosModel = get_tera = None
 from ackermann_msgs.msg import AckermannDrive
 from gazebo_msgs.msg import ModelStates, ModelState
 from gazebo_msgs.srv import SetModelState
@@ -32,10 +36,10 @@ if 'numpy._core' not in sys.modules:
     sys.modules['numpy._core'] = np.core
 
 # MPC Settings
-HORIZON = 8           # Keep horizon small for faster solve
+HORIZON = 16           # Keep horizon small for faster solve
 PUBLISH_DEBUG_MARKERS = True  # Set True to visualize (adds overhead)
-DT = 0.1              # Time step (Must match your data recorder freq, e.g., 20Hz = 0.05)
-L_WHEELBASE = 1.75     # Meters (approx for Polaris GEM)
+DT = 0.05              # Time step (Must match your data recorder freq, e.g., 20Hz = 0.05)
+L_WHEELBASE = 1.95   
 MAX_ACCEL = 2.0        # m/s^2 limit on commanded speed change
 MAX_STEER_RATE = 0.5   # rad/s limit on steering command rate
 
@@ -146,27 +150,36 @@ class NeuralMPC:
             u_guess[1, :] = steer_guess
 
         # States: re-rollout from the CURRENT state using the guessed controls.
-        # This keeps the initial guess dynamically consistent instead of simply
-        # shifting the previous predicted states (which can drift and hurt IPOPT).
-        x_guess = np.zeros((4, HORIZON + 1))
-        x_guess[:, 0] = [curr_x, curr_y, curr_yaw, curr_v]
-        steer_actual_seq = self.estimate_steering_profile(u_guess)
+        # For acados we augment the state with steer_actual to model 1-step delay.
+        x_guess = np.zeros((5, HORIZON + 1))
+        x_guess[:4, 0] = [curr_x, curr_y, curr_yaw, curr_v]
+
+        steer0 = self.steer_actual if np.isfinite(self.steer_actual) else float(u_guess[1, 0])
+        x_guess[4, 0] = steer0
+        steer_actual_states = np.zeros(HORIZON + 1, dtype=float)
+        steer_actual_states[0] = steer0
+        for k in range(HORIZON):
+            steer_actual_states[k + 1] = u_guess[1, k]
+
+        steer_actual_seq = steer_actual_states[:HORIZON]
         temp_state = np.array([curr_x, curr_y, curr_yaw, curr_v], dtype=float)
         for k in range(HORIZON):
             dx = self.rollout_dynamics_np(temp_state, u_guess[:, k], steer_actual_seq[k])
             temp_state = temp_state + dx
             temp_state[2] = self.wrap_angle(temp_state[2])
-            x_guess[:, k + 1] = temp_state
+            x_guess[:4, k + 1] = temp_state
+            x_guess[4, k + 1] = steer_actual_states[k + 1]
 
         # Guard against NaNs/Infs from the warm rollout
         if not np.all(np.isfinite(x_guess)):
-            x_guess = np.zeros((4, HORIZON + 1))
+            x_guess = np.zeros((5, HORIZON + 1))
             for k in range(HORIZON + 1):
                 dist = curr_v * DT * k
                 x_guess[0, k] = curr_x + dist * np.cos(curr_yaw)
                 x_guess[1, k] = curr_y + dist * np.sin(curr_yaw)
                 x_guess[2, k] = curr_yaw
                 x_guess[3, k] = curr_v
+                x_guess[4, k] = steer_actual_states[min(k, HORIZON)]
 
         return x_guess, u_guess
 
@@ -222,20 +235,111 @@ class NeuralMPC:
         dy_glob = np.sin(yaw_curr) * out_real[0] + np.cos(yaw_curr) * out_real[1]
         return np.array([dx_glob, dy_glob, out_real[2], out_real[3]], dtype=float)
 
+    def create_acados_model(self):
+        """Build the acados discrete-time model using the learned neural net."""
+        if AcadosModel is None:
+            raise RuntimeError("acados_template is not installed. See README for setup.")
+
+        model = AcadosModel()
+        x = ca.SX.sym('x', 5)  # [x, y, yaw, v, steer_actual]
+        u = ca.SX.sym('u', 2)  # [v_cmd, steer_cmd]
+        p = ca.SX.sym('p', 4)  # reference [x, y, yaw, v] for cost
+
+        v_actual = x[3]
+        v_cmd = u[0]
+        steer_cmd = u[1]
+        steer_actual = x[4]
+
+        input_features = ca.vertcat(v_actual, v_cmd, steer_cmd, steer_actual, DT)
+        sx_mean = ca.DM(self.sx_mean)
+        sx_scale = ca.DM(self.sx_scale)
+        sy_mean = ca.DM(self.sy_mean)
+        sy_scale = ca.DM(self.sy_scale)
+        inp_norm = (input_features - sx_mean) / sx_scale
+
+        act = ca.tanh
+        w1 = ca.DM(self.weights['net.0.weight']); b1 = ca.DM(self.weights['net.0.bias'])
+        w2 = ca.DM(self.weights['net.2.weight']); b2 = ca.DM(self.weights['net.2.bias'])
+        w3 = ca.DM(self.weights['net.4.weight']); b3 = ca.DM(self.weights['net.4.bias'])
+        w4 = ca.DM(self.weights['net.6.weight']); b4 = ca.DM(self.weights['net.6.bias'])
+
+        h1 = act(ca.mtimes(w1, inp_norm) + b1)
+        h2 = act(ca.mtimes(w2, h1) + b2)
+        h3 = act(ca.mtimes(w3, h2) + b3)
+        out_norm = ca.mtimes(w4, h3) + b4
+        out_real = out_norm * sy_scale + sy_mean
+
+        # Model correction gain (keep consistent with training validation)
+        YAW_GAIN = 1.0
+        out_real = ca.vertcat(out_real[0], out_real[1], out_real[2] * YAW_GAIN, out_real[3])
+
+        yaw_curr = x[2]
+        dx_glob = ca.cos(yaw_curr) * out_real[0] - ca.sin(yaw_curr) * out_real[1]
+        dy_glob = ca.sin(yaw_curr) * out_real[0] + ca.cos(yaw_curr) * out_real[1]
+
+        x_next = ca.vertcat(
+            x[0] + dx_glob,
+            x[1] + dy_glob,
+            x[2] + out_real[2],
+            x[3] + out_real[3],
+            steer_cmd  # actuator reaches command by next step
+        )
+
+        model.x = x
+        model.u = u
+        model.p = p
+        model.disc_dyn_expr = x_next
+        model.name = "gem_nn_mpc"
+        return model
+
     def solve_with_guess(self, ref_traj, use_prev=True):
-        """Try solving with either a warm start (use_prev=True) or cold start."""
+        """Solve the acados OCP with warm/cold start guesses."""
         try:
             x_guess, u_guess = self.build_initial_guess(ref_traj, use_prev=use_prev)
-            self.opti.set_value(self.P_current, self.current_state)
-            self.opti.set_value(self.P_ref, ref_traj)
-            steer_act_val = self.steer_actual if np.isfinite(self.steer_actual) else float(u_guess[1, 0])
-            self.opti.set_value(self.P_steer_actual, steer_act_val)
-            self.opti.set_initial(self.X_var, x_guess)
-            self.opti.set_initial(self.U_var, u_guess)
-            return self.opti.solve()
+            steer0 = self.steer_actual if np.isfinite(self.steer_actual) else float(u_guess[1, 0])
+            x0 = np.array([
+                self.current_state[0],
+                self.current_state[1],
+                self.current_state[2],
+                self.current_state[3],
+                steer0,
+            ], dtype=float)
+
+            # Fix initial state
+            self.solver.set(0, 'lbx', x0)
+            self.solver.set(0, 'ubx', x0)
+
+            # Shift references so stage cost on x_k roughly matches old cost on x_{k+1}
+            ref_shift = np.zeros_like(ref_traj)
+            ref_shift[:, 0] = self.current_state
+            if ref_traj.shape[1] > 1:
+                ref_shift[:, 1:] = ref_traj[:, :-1]
+            ref_terminal = ref_traj[:, -1]
+
+            for k in range(HORIZON):
+                self.solver.set(k, 'p', ref_shift[:, k])
+            self.solver.set(HORIZON, 'p', ref_terminal)
+
+            # Warm start initial guess
+            for k in range(HORIZON + 1):
+                self.solver.set(k, 'x', x_guess[:, k])
+            for k in range(HORIZON):
+                self.solver.set(k, 'u', u_guess[:, k])
+
+            status = self.solver.solve()
+            if status != 0:
+                raise RuntimeError(f"acados solver status {status}")
+
+            u_opt = np.zeros((2, HORIZON))
+            x_opt = np.zeros((self.nx, HORIZON + 1))
+            for k in range(HORIZON):
+                u_opt[:, k] = self.solver.get(k, 'u')
+                x_opt[:, k] = self.solver.get(k, 'x')
+            x_opt[:, HORIZON] = self.solver.get(HORIZON, 'x')
+
+            return x_opt, u_opt
         except Exception as e:
             if use_prev:
-                # Clear the cached warm start so the next iteration does not keep failing.
                 self.prev_u_opt = None
                 self.prev_x_opt = None
                 print(f"Solver warm-start failed ({e}); trying cold start.")
@@ -267,137 +371,106 @@ class NeuralMPC:
                 return False
 
     def setup_mpc(self):
-        """Constructs the optimization problem using CasADi"""
-        opti = ca.Opti()
-        self.opti = opti
-        
-        # --- Decision Variables ---
-        self.X_var = opti.variable(4, HORIZON + 1) # [x, y, yaw, v]
-        self.U_var = opti.variable(2, HORIZON)     # [v_cmd, steer_cmd]
-        
-        # --- Parameters ---
-        self.P_current = opti.parameter(4) # [x, y, yaw, v]
-        self.P_ref = opti.parameter(4, HORIZON) # [x, y, yaw, v]
-        self.P_steer_actual = opti.parameter() # measured steering angle at current step
+        """Constructs the optimization problem using acados."""
+        if AcadosOcp is None:
+            raise RuntimeError(
+                "acados_template is not installed. "
+                "Install acados + acados_template before running this controller."
+            )
 
-        # --- Cost Function Weights (TUNED) ---
-        Q_lat = 40.0    
-        Q_yaw = 1.0     
-        Q_vel = 5.0 
-        R_steer = 1.0    
-        R_accel = 1.0 
-        R_dsteer = 1.0 
-        Q_safety = 1.0   
+        # acados_template ships a tera renderer binary; on older GLIBC (e.g. Ubuntu 20.04)
+        # the default binary can fail to run. Fetch a compatible one if needed.
+        if get_tera is not None:
+            try:
+                get_tera(tera_version="0.0.34")
+            except Exception as e:
+                rospy.logwarn(f"acados get_tera failed: {e}")
 
-        cost = 0
-        for k in range(HORIZON):
-            dx = self.X_var[0, k+1] - self.P_ref[0, k]
-            dy = self.X_var[1, k+1] - self.P_ref[1, k]
-            ref_yaw = self.P_ref[2, k]
-            e_lat = -ca.sin(ref_yaw) * dx + ca.cos(ref_yaw) * dy
-            yaw_diff = self.X_var[2, k+1] - self.P_ref[2, k]
-            e_yaw = self.wrap_angle_casadi(yaw_diff)
-            e_v = self.X_var[3, k+1] - self.P_ref[3, k]
+        model = self.create_acados_model()
+        ocp = AcadosOcp()
+        ocp.model = model
+        # Horizon length (newer acados_template prefers N_horizon)
+        if hasattr(ocp.solver_options, "N_horizon"):
+            ocp.solver_options.N_horizon = HORIZON
+        else:
+            ocp.dims.N = HORIZON
+        ocp.parameter_values = np.zeros((4,))
 
-            cost += Q_lat * (e_lat**2)
-            cost += Q_yaw * (e_yaw**2)
-            cost += Q_vel * (e_v**2)
-            
-            # Control Regularization
-            cost += R_accel * (self.U_var[0, k]**2)
-            cost += R_steer * (self.U_var[1, k]**2)
+        nx = int(model.x.size()[0])
+        nu = int(model.u.size()[0])
+        self.nx = nx
+        self.nu = nu
 
-            # --- SAFETY COST: Slow down when steering ---
-            # Penalize (velocity * steering_angle)^2
-            # This encourages low velocity if steering is high, or low steering if velocity is high
-            cost += Q_safety * (self.U_var[0, k] * self.U_var[1, k])**2
+        # --- Cost Function Weights (same as previous tuning) ---
+        Q_lat = 10.0
+        Q_yaw = 1.0
+        Q_vel = 5.0
+        R_steer = 5.0
+        R_accel = 1.0
+        Q_safety = 1.0
 
-            # if k < HORIZON - 1:
-            #     # Damping: Penalize rapid changes in steering
-            #     cost += R_dsteer * (self.U_var[1, k+1] - self.U_var[1, k])**2
+        x_sym = model.x
+        u_sym = model.u
+        p_sym = model.p  # [x_ref, y_ref, yaw_ref, v_ref]
+        dx = x_sym[0] - p_sym[0]
+        dy = x_sym[1] - p_sym[1]
+        ref_yaw = p_sym[2]
+        e_lat = -ca.sin(ref_yaw) * dx + ca.cos(ref_yaw) * dy
+        e_yaw = self.wrap_angle_casadi(x_sym[2] - ref_yaw)
+        e_v = x_sym[3] - p_sym[3]
 
-        opti.minimize(cost)
+        y_expr = ca.vertcat(
+            e_lat,
+            e_yaw,
+            e_v,
+            u_sym[0],
+            u_sym[1],
+            u_sym[0] * u_sym[1],
+        )
+        ocp.model.cost_y_expr = y_expr
+        ocp.model.cost_y_expr_0 = y_expr
+        ocp.cost.cost_type = "NONLINEAR_LS"
+        ocp.cost.cost_type_0 = "NONLINEAR_LS"
+        W = np.diag([Q_lat, Q_yaw, Q_vel, R_accel, R_steer, Q_safety])
+        ocp.cost.W = W
+        ocp.cost.W_0 = W
+        ocp.cost.yref = np.zeros((6,))
+        ocp.cost.yref_0 = np.zeros((6,))
+
+        # Terminal cost on final state only
+        y_expr_e = ca.vertcat(e_lat, e_yaw, e_v)
+        ocp.model.cost_y_expr_e = y_expr_e
+        ocp.cost.cost_type_e = "NONLINEAR_LS"
+        ocp.cost.W_e = np.diag([Q_lat, Q_yaw, Q_vel])
+        ocp.cost.yref_e = np.zeros((3,))
 
         # --- Constraints ---
-        opti.subject_to(self.X_var[:, 0] == self.P_current)
+        ocp.constraints.idxbx_0 = np.arange(nx)
+        ocp.constraints.lbx_0 = np.zeros(nx)
+        ocp.constraints.ubx_0 = np.zeros(nx)
 
-        for k in range(HORIZON):
-            # Velocity & Steering Limits
-            # Prevent reverse by disallowing negative speed commands
-            opti.subject_to(opti.bounded(MIN_REF_V, self.U_var[0, k], MAX_REF_V))
-            opti.subject_to(opti.bounded(-0.6, self.U_var[1, k], 0.6))
-            if k > 0:
-                # Rate limits derived from recorded logs (per-step change)
-                opti.subject_to(opti.bounded(-MAX_ACCEL * DT,
-                                             self.U_var[0, k] - self.U_var[0, k-1],
-                                             MAX_ACCEL * DT))
-                opti.subject_to(opti.bounded(-MAX_STEER_RATE * DT,
-                                             self.U_var[1, k] - self.U_var[1, k-1],
-                                             MAX_STEER_RATE * DT))
+        ocp.constraints.idxbu = np.array([0, 1])
+        # Forward-only: do not allow negative speed commands
+        ocp.constraints.lbu = np.array([max(0.0, MIN_REF_V), -0.6])
+        ocp.constraints.ubu = np.array([MAX_REF_V, 0.6])
 
-            # --- Neural Network Dynamics (Reconstruction) ---
-            state_k = self.X_var[:, k]
-            ctrl_k  = self.U_var[:, k]
+        # Also keep predicted actual speed nonnegative to avoid "reverse" plans
+        ocp.constraints.idxbx = np.array([3])  # v index in state [x,y,yaw,v,steer_actual]
+        ocp.constraints.lbx = np.array([0.0])
+        ocp.constraints.ubx = np.array([MAX_REF_V])
+        ocp.constraints.idxbx_e = np.array([3])
+        ocp.constraints.lbx_e = np.array([0.0])
+        ocp.constraints.ubx_e = np.array([MAX_REF_V])
 
-            # Estimate steering actual: use measured for k=0, otherwise assume actuator hits previous command
-            if k == 0:
-                steer_actual_k = self.P_steer_actual
-            else:
-                steer_actual_k = self.U_var[1, k-1]
+        # --- Solver settings ---
+        ocp.solver_options.integrator_type = "DISCRETE"
+        ocp.solver_options.nlp_solver_type = "SQP_RTI"
+        ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
+        ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+        ocp.solver_options.tf = HORIZON * DT
+        ocp.solver_options.print_level = 0
 
-            # Input: [v_actual, v_cmd, steer_cmd, steer_actual, dt]
-            input_features = ca.vertcat(state_k[3], ctrl_k[0], ctrl_k[1], steer_actual_k, DT)
-            inp_norm = (input_features - self.sx_mean) / self.sx_scale
-            
-            # Use tanh to mirror the training activation (see train_model.py)
-            act = ca.tanh
-            
-            # Layer 1
-            w1 = self.weights['net.0.weight']; b1 = self.weights['net.0.bias']
-            h1 = act(ca.mtimes(w1, inp_norm) + b1)
-            # Layer 2
-            w2 = self.weights['net.2.weight']; b2 = self.weights['net.2.bias']
-            h2 = act(ca.mtimes(w2, h1) + b2)
-            # Layer 3
-            w3 = self.weights['net.4.weight']; b3 = self.weights['net.4.bias']
-            h3 = act(ca.mtimes(w3, h2) + b3)
-            # Output Layer
-            w4 = self.weights['net.6.weight']; b4 = self.weights['net.6.bias']
-            out_norm = ca.mtimes(w4, h3) + b4
-            
-            out_real = out_norm * self.sy_scale + self.sy_mean
-            
-            # --- MODEL CORRECTION GAIN ---
-            # Validation showed the trained model underestimates Yaw Rate by ~6x.
-            # Since we cannot retrain, we manually boost the predicted yaw change.
-            # This makes the MPC realize the car turns fast, so it commands smoother/smaller steering.
-            YAW_GAIN = 6.0 
-            out_real[2] = out_real[2] * YAW_GAIN
-            
-            # Global Frame Update
-            yaw_curr = state_k[2]
-            dx_glob = ca.cos(yaw_curr)*out_real[0] - ca.sin(yaw_curr)*out_real[1]
-            dy_glob = ca.sin(yaw_curr)*out_real[0] + ca.cos(yaw_curr)*out_real[1]
-            
-            opti.subject_to(self.X_var[0, k+1] == state_k[0] + dx_glob)
-            opti.subject_to(self.X_var[1, k+1] == state_k[1] + dy_glob)
-            opti.subject_to(self.X_var[2, k+1] == state_k[2] + out_real[2])
-            opti.subject_to(self.X_var[3, k+1] == state_k[3] + out_real[3])
-
-        # --- SOLVER SETTINGS ---
-        opts = {
-            'ipopt.print_level': 0, 
-            'print_time': 0, 
-            'ipopt.sb': 'yes',
-            'ipopt.max_iter': 1000,         
-            'ipopt.max_cpu_time': 1.0,     # seconds (avoid premature timeout)
-            'ipopt.hessian_approximation': 'limited-memory', # L-BFGS
-            'ipopt.tol': 1e-1,
-            'ipopt.acceptable_tol': 5e-1,
-            'ipopt.acceptable_obj_change_tol': 1e-2,
-            'ipopt.warm_start_init_point': 'yes'
-        }
-        opti.solver('ipopt', opts)
+        self.solver = AcadosOcpSolver(ocp, json_file="acados_ocp.json")
 
     def state_callback(self, msg):
         """Extracts robot state from Gazebo ModelStates"""
@@ -576,8 +649,7 @@ class NeuralMPC:
                     if sol is None:
                         raise RuntimeError("Solver failed after warm and cold starts")
                 
-                u_opt = sol.value(self.U_var)
-                x_opt = sol.value(self.X_var)
+                x_opt, u_opt = sol
                 
                 # Store for next iteration
                 self.prev_u_opt = u_opt
@@ -600,19 +672,10 @@ class NeuralMPC:
                 # This keeps the car moving rather than freezing
                 print(f"Solver Limit/Fail: {e} -> Using Fallback")
                 
-                # Often 'Opti' object still has the debug values even if it failed
-                try:
-                    debug_u = np.array(self.opti.debug.value(self.U_var))
-                    debug_x = np.array(self.opti.debug.value(self.X_var))
-                    self.prev_u_opt = debug_u
-                    self.prev_x_opt = debug_x
-                    cmd_v = float(debug_u[0, 0])
-                    cmd_s = float(debug_u[1, 0])
-                except Exception:
-                    # No usable debug info; drop warm-start memory to force cold next loop
-                    self.prev_u_opt = None
-                    self.prev_x_opt = None
-                    cmd_v, cmd_s = last_u # Absolute fallback
+                # No debug state from acados; drop warm-start memory to force cold next loop
+                self.prev_u_opt = None
+                self.prev_x_opt = None
+                cmd_v, cmd_s = last_u  # Absolute fallback
                 
                 msg = AckermannDrive()
                 msg.speed = float(cmd_v)
@@ -622,7 +685,8 @@ class NeuralMPC:
             # Visualize
             if PUBLISH_DEBUG_MARKERS:
                 try:
-                    self.publish_markers(ref_traj, self.prev_x_opt)
+                    pred_xy = self.prev_x_opt[:4, :] if self.prev_x_opt is not None else None
+                    self.publish_markers(ref_traj, pred_xy)
                 except Exception as e:
                     print(f"Viz Error: {e}")
 
