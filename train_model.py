@@ -3,11 +3,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
 import pickle
+import argparse
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+try:
+    import matplotlib.pyplot as plt
+except ImportError:  # allow scalers-only mode without plotting deps
+    plt = None
 
 # ==========================================
 # 1. CONFIGURATION
@@ -93,13 +98,16 @@ def load_and_process_data(filename):
     dy_global = df_next['y'].values - df_curr['y'].values
     yaw_curr = df_curr['yaw'].values
 
-    # Rotate to Local Frame
-    dx_local = np.cos(yaw_curr) * dx_global + np.sin(yaw_curr) * dy_global
-    dy_local = -np.sin(yaw_curr) * dx_global + np.cos(yaw_curr) * dy_global
-    
     # Delta Yaw (wrapped)
     d_yaw = df_next['yaw'].values - df_curr['yaw'].values
     d_yaw = np.arctan2(np.sin(d_yaw), np.cos(d_yaw))
+
+    # Rotate to local frame using yaw at the middle of the step.
+    # This matches the midpoint integration used in the MPC model and makes dy_local
+    # represent *true* lateral slip rather than the chord offset from turning.
+    yaw_mid = yaw_curr + 0.5 * d_yaw
+    dx_local = np.cos(yaw_mid) * dx_global + np.sin(yaw_mid) * dy_global
+    dy_local = -np.sin(yaw_mid) * dx_global + np.cos(yaw_mid) * dy_global
     
     d_v = df_next['v_actual'].values - df_curr['v_actual'].values
     d_steer = df_next['steer_actual'].values - df_curr['steer_actual'].values
@@ -177,6 +185,14 @@ class DynamicsModel(nn.Module):
 # 4. TRAINING ROUTINE
 # ==========================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--scalers-only",
+        action="store_true",
+        help="Rebuild and save scalers from DATA_DIR, then exit (no training).",
+    )
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -208,6 +224,22 @@ if __name__ == "__main__":
              x_mean=scaler_x.mean_, x_scale=scaler_x.scale_,
              y_mean=scaler_y.mean_, y_scale=scaler_y.scale_)
     print("Scalers saved.")
+
+    # Sanity check: dy_local (Y[:,1]) should have small but non-zero variance.
+    # If `scaler_y.var_[1]` is ~0, sklearn will set `scale_[1]=1`, and MPC can
+    # denormalize dy_local incorrectly (often looks like sideways slip).
+    if Y_train_raw.shape[1] >= 2:
+        dy_std = float(np.std(Y_train_raw[:, 1]))
+        dy_scale = float(scaler_y.scale_[1]) if len(scaler_y.scale_) > 1 else float("nan")
+        print(f"dy_local std (train raw): {dy_std:.6g} | scaler_y.scale_[1]: {dy_scale:.6g}")
+        if np.isclose(dy_std, 0.0) or np.isclose(dy_scale, 1.0):
+            print(
+                "[WARN] dy_local scaling looks suspicious (std near 0 or scale==1). "
+                "This can cause large predicted lateral motion in MPC."
+            )
+
+    if args.scalers_only:
+        raise SystemExit(0)
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
     Y_train_t = torch.tensor(Y_train, dtype=torch.float32, device=device)
@@ -318,21 +350,24 @@ if __name__ == "__main__":
         print("No turns found in test set to evaluate.")
 
     # Plot
-    plt.figure(figsize=(15, 10))
-    
-    # Sort by turning magnitude for cleaner plotting
-    sort_idx = np.argsort(d_yaw_test_real)
-    
-    labels = ['dX', 'dY', 'dYaw', 'dV', 'dSteer']
-    for i in range(5):
-        plt.subplot(2, 3, i+1)
-        # Plot only a subset of sorted data to see the "S" curve of prediction
-        plt.plot(actual_real[sort_idx, i], label='Actual', color='black', alpha=0.6)
-        plt.plot(pred_real[sort_idx, i], label='Pred', color='red', alpha=0.6)
-        plt.title(labels[i])
-        plt.legend()
-        plt.grid(True)
+    if plt is None:
+        print("[WARN] matplotlib not available; skipping validation plot.")
+    else:
+        plt.figure(figsize=(15, 10))
         
-    plt.tight_layout()
-    plt.savefig(PLOT_SAVE_PATH)
-    print(f"Plot saved to {PLOT_SAVE_PATH}")
+        # Sort by turning magnitude for cleaner plotting
+        sort_idx = np.argsort(d_yaw_test_real)
+        
+        labels = ['dX', 'dY', 'dYaw', 'dV', 'dSteer']
+        for i in range(5):
+            plt.subplot(2, 3, i+1)
+            # Plot only a subset of sorted data to see the "S" curve of prediction
+            plt.plot(actual_real[sort_idx, i], label='Actual', color='black', alpha=0.6)
+            plt.plot(pred_real[sort_idx, i], label='Pred', color='red', alpha=0.6)
+            plt.title(labels[i])
+            plt.legend()
+            plt.grid(True)
+            
+        plt.tight_layout()
+        plt.savefig(PLOT_SAVE_PATH)
+        print(f"Plot saved to {PLOT_SAVE_PATH}")

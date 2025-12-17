@@ -10,4 +10,5 @@ acados_solver_*.h
 acados_sim_*.c
 acados_sim_*.h
 c_generated_code/
+c_generated_code_*/
 *.json
