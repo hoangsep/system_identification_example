@@ -1,6 +1,6 @@
 import pickle, torch, numpy as np, pandas as pd
 from sklearn.model_selection import train_test_split
-import train_model as tm
+from gem_mpc import train_model as tm
 
 # Load data and scalers
 X_raw, Y_raw = tm.load_all_and_process(tm.DATA_DIR)

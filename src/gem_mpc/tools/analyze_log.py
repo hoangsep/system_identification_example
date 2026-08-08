@@ -1,7 +1,9 @@
 import pandas as pd
 import sys
 
-def analyze_log(csv_path='mpc_debug.csv'):
+from gem_mpc import paths
+
+def analyze_log(csv_path=paths.RESULTS_DIR / "mpc_debug.csv"):
     try:
         df = pd.read_csv(csv_path)
     except:
@@ -9,7 +11,7 @@ def analyze_log(csv_path='mpc_debug.csv'):
         return
 
     # Find first row where Abs(CTE) > 1.0
-    divergence = df[df['cte'].abs() > 1.0]
+    divergence = df[df['cte_signed'].abs() > 1.0]
     
     if len(divergence) == 0:
         print("CTE never exceeded 1.0m.")

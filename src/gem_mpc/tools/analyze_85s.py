@@ -1,7 +1,9 @@
 import pandas as pd
 import numpy as np
 
-def analyze_85s(csv_path='mpc_debug.csv'):
+from gem_mpc import paths
+
+def analyze_85s(csv_path=paths.RESULTS_DIR / "mpc_debug.csv"):
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
@@ -20,15 +22,15 @@ def analyze_85s(csv_path='mpc_debug.csv'):
 
     print(f"\nAnalysis Window: 84.0s to 87.0s ({len(window)} samples)")
     print("-" * 100)
-    print(f"{'Time':<8} {'CTE':<8} {'Cmd':<8} {'AvgAct':<8} {'L_Act':<8} {'R_Act':<8} {'YawRate':<8} {'Az':<8} {'Wz':<8}")
+    print(f"{'Time':<8} {'CTE':<8} {'Cmd':<8} {'AvgAct':<8} {'YawRate':<8} {'Az':<8} {'Wz':<8}")
     print("-" * 100)
     
     for i, row in window.iterrows():
-        print(f"{row['t']:<8.3f} {row['cte']:<8.4f} {row['steer_cmd']:<8.4f} {row['steer_act']:<8.4f} {row['steer_left']:<8.4f} {row['steer_right']:<8.4f} {row['yaw_rate']:<8.4f} {row['az']:<8.4f} {row['wz']:<8.4f}")
+        print(f"{row['t']:<8.3f} {row['cte_signed']:<8.4f} {row['steer_cmd_pub']:<8.4f} {row['steer_act']:<8.4f} {row['yaw_rate']:<8.4f} {row['az']:<8.4f} {row['wz']:<8.4f}")
 
     # Check for spikes
     print("\nStatistics in Window:")
-    print(window[['cte', 'steer_cmd', 'steer_act', 'az', 'wz']].describe())
+    print(window[['cte_signed', 'steer_cmd_pub', 'steer_act', 'az', 'wz']].describe())
 
 if __name__ == "__main__":
     analyze_85s()

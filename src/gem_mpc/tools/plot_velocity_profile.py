@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
+from gem_mpc import paths
+
 # Configuration (Match MPC)
 COL_X = 0
 COL_Y = 1
@@ -83,7 +85,7 @@ def downsample_path(path, min_dist=0.1):
             last_p = curr_p
     return np.array(downsampled)
 
-def plot_velocity_profile(csv_path='wps.csv'):
+def plot_velocity_profile(csv_path=paths.WAYPOINTS_CSV):
     if not os.path.exists(csv_path):
         print(f"File {csv_path} not found.")
         return
@@ -154,9 +156,10 @@ def plot_velocity_profile(csv_path='wps.csv'):
     plt.title("Correlation: Curvature vs Velocity")
     
     plt.tight_layout()
-    plt.savefig('velocity_profile_debug.png')
-    print("Saved velocity_profile_debug.png")
+    out = paths.result('velocity_profile_debug.png')
+    plt.savefig(out)
+    print(f"Saved {out}")
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else 'wps.csv'
+    path = sys.argv[1] if len(sys.argv) > 1 else paths.WAYPOINTS_CSV
     plot_velocity_profile(path)

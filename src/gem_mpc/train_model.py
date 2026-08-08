@@ -12,6 +12,8 @@ import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
+from gem_mpc import paths
+
 try:
     import matplotlib
     matplotlib.use("Agg")
@@ -23,15 +25,15 @@ except Exception:
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
-DATA_DIR = Path("neo_data")
+DATA_DIR = paths.DATA_DIR
 
-MODEL_SAVE_PATH = "gem_dynamics.pth"
-SCALER_SAVE_PATH = "gem_scaler.pkl"
-SCALER_ARRAY_PATH = "gem_scaler_arrays.npz"
+MODEL_SAVE_PATH = paths.MODEL_PATH
+SCALER_SAVE_PATH = paths.SCALER_PATH
+SCALER_ARRAY_PATH = paths.SCALER_ARRAY_PATH
 
-SYSID_PLOT_PATH = "sysid_validation_plot.png"
-SYSID_INPUT_OUTPUT_PLOT_PATH = "sysid_input_output.png"
-RMSE_PLOT_PATH = "rmse_plot.png"
+SYSID_PLOT_PATH = paths.RESULTS_DIR / "sysid_validation_plot.png"
+SYSID_INPUT_OUTPUT_PLOT_PATH = paths.RESULTS_DIR / "sysid_input_output.png"
+RMSE_PLOT_PATH = paths.RESULTS_DIR / "rmse_plot.png"
 
 # Training Hyperparameters
 EPOCHS = 8000
@@ -379,6 +381,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    paths.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    paths.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1) Load data
     X_raw, Y_raw = load_all_and_process(Path(args.data_dir))

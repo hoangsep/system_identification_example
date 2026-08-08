@@ -15,7 +15,7 @@ services:
       - QT_X11_NO_MITSHM=1
       - LIBGL_ALWAYS_SOFTWARE=1
       - ACADOS_SOURCE_DIR=/opt/acados
-      - NVIDIA_ visible_devices=all
+      - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
     volumes:
       # Mount X11 socket for GUI (Gazebo/RViz)

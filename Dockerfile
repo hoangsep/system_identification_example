@@ -34,16 +34,8 @@ RUN apt-get update && apt-get install -y \
 # - torch: Neural Networks for System Identification
 # - casadi: The industry standard optimization solver for MPC (works great with Python)
 # - scipy: General scientific computing
-RUN pip3 install --no-cache-dir \
-    numpy \
-    pandas \
-    matplotlib \
-    scipy \
-    scikit-learn \
-    casadi \
-    jinja2 \
-    torch \
-    torchvision
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 
 # 3. Install acados (C library + Python template) to a common path
 ENV ACADOS_SOURCE_DIR=/opt/acados
@@ -62,11 +54,16 @@ ENV PYTHONPATH=${PYTHONPATH}:${ACADOS_SOURCE_DIR}/interfaces/acados_template
 RUN mkdir -p /root/catkin_ws/src
 WORKDIR /root/catkin_ws
 
-# 5. Add source setup to bashrc so you don't have to type it every time
+# 5. Put the gem_mpc package on the path
+# docker-compose mounts this repo at /root/catkin_ws/src/assignment at runtime,
+# so `python3 -m gem_mpc.mpc` works without an install step
+ENV PYTHONPATH=${PYTHONPATH}:/root/catkin_ws/src/assignment/src
+
+# 6. Add source setup to bashrc so you don't have to type it every time
 RUN echo "source /opt/ros/noetic/setup.bash" >> /root/.bashrc
 RUN echo "source /root/catkin_ws/devel/setup.bash" >> /root/.bashrc
 
-# 6. Build the empty workspace initially to verify setup
+# 7. Build the empty workspace initially to verify setup
 RUN /bin/bash -c "source /opt/ros/noetic/setup.bash && catkin_make"
 
 # Entrypoint

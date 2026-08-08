@@ -1,0 +1,12 @@
+# python dependencies for system identification, training and MPC
+# rospy / tf / ackermann_msgs come from the ROS Noetic install
+# acados_template is installed from the acados source tree (see Dockerfile step 3)
+numpy
+pandas
+matplotlib
+scipy
+scikit-learn
+casadi
+jinja2
+torch
+torchvision

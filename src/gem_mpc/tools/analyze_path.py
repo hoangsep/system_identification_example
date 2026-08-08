@@ -2,7 +2,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-def analyze_path(csv_path='wps.csv'):
+from gem_mpc import paths
+
+def analyze_path(csv_path=paths.WAYPOINTS_CSV):
     try:
         df = pd.read_csv(csv_path, header=None)
         path = df.values
@@ -46,7 +48,7 @@ def analyze_path(csv_path='wps.csv'):
     plt.title("Path Segment Lengths")
     plt.xlabel("Index")
     plt.ylabel("Distance (m)")
-    plt.savefig("path_analysis.png")
+    plt.savefig(paths.result("path_analysis.png"))
     print("\nSaved path_analysis.png")
 
 if __name__ == "__main__":

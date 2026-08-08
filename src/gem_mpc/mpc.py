@@ -17,6 +17,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from tf.transformations import euler_from_quaternion, quaternion_from_euler
 
+from gem_mpc import paths
+
 # Plotting (headless safe)
 try:
     import matplotlib
@@ -29,10 +31,10 @@ except Exception:
 # ============================
 # CONFIG
 # ============================
-MODEL_PATH = "gem_dynamics.pth"
-SCALER_PATH = "gem_scaler.pkl"
-SCALER_ARRAY_PATH = "gem_scaler_arrays.npz"
-PATH_CSV = "wps.csv"
+MODEL_PATH = paths.MODEL_PATH
+SCALER_PATH = paths.SCALER_PATH
+SCALER_ARRAY_PATH = paths.SCALER_ARRAY_PATH
+PATH_CSV = paths.WAYPOINTS_CSV
 
 if "numpy._core" not in sys.modules:
     sys.modules["numpy._core"] = np.core
@@ -56,8 +58,11 @@ STEER_GAIN_COMP = 1.0
 STEER_OFFSET = 0.0
 
 # RMSE / plots
-RMSE_PLOT_PATH = "mpc_rmse.png"
-CTE_PLOT_PATH = "mpc_cte_signed.png"
+RMSE_PLOT_PATH = paths.RESULTS_DIR / "mpc_rmse.png"
+CTE_PLOT_PATH = paths.RESULTS_DIR / "mpc_cte_signed.png"
+
+DEBUG_CSV_PATH = paths.RESULTS_DIR / "mpc_debug.csv"
+TRAJ_PICKLE_PATH = paths.RESULTS_DIR / "mpc_trajectories.pkl"
 
 # online sysid evaluation tolerance
 EVAL_DT_TOL = 0.02       # accept dt_meas in [DT - tol, DT + tol]
@@ -205,15 +210,17 @@ class NeuralMPC:
                     "last_cmd_steer",
                 ],
             )
-            df.to_csv("mpc_debug.csv", index=False)
-            print("Saved mpc_debug.csv")
+            paths.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            df.to_csv(DEBUG_CSV_PATH, index=False)
+            print(f"Saved {DEBUG_CSV_PATH}")
 
         # traj pickle
         if self.traj_log:
             try:
-                with open("mpc_trajectories.pkl", "wb") as f:
+                paths.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+                with open(TRAJ_PICKLE_PATH, "wb") as f:
                     pickle.dump(self.traj_log, f)
-                print("Saved mpc_trajectories.pkl")
+                print(f"Saved {TRAJ_PICKLE_PATH}")
             except Exception as e:
                 print(f"Failed to save trajectories: {e}")
 
@@ -239,7 +246,7 @@ class NeuralMPC:
             ax.set_xlabel("time (s)")
             ax.set_ylabel("cte_signed (m)")
             plt.tight_layout()
-            plt.savefig(CTE_PLOT_PATH, dpi=180)
+            plt.savefig(paths.result(CTE_PLOT_PATH.name), dpi=180)
             plt.close(fig)
             print(f"Saved {CTE_PLOT_PATH}")
 
@@ -264,7 +271,7 @@ class NeuralMPC:
             ax.set_ylabel("RMSE (units of each output)")
             ax.legend()
             plt.tight_layout()
-            plt.savefig(RMSE_PLOT_PATH, dpi=180)
+            plt.savefig(paths.result(RMSE_PLOT_PATH.name), dpi=180)
             plt.close(fig)
             print(f"Saved {RMSE_PLOT_PATH}")
 
@@ -540,7 +547,9 @@ class NeuralMPC:
         ocp.solver_options.tf = HORIZON * DT
         ocp.solver_options.print_level = 0
 
-        self.solver = AcadosOcpSolver(ocp, json_file="acados_ocp.json")
+        # keep generated C code and the solver JSON out of the repo root
+        ocp.code_export_directory = str(paths.acados_build() / "c_generated_code")
+        self.solver = AcadosOcpSolver(ocp, json_file=str(paths.ACADOS_OCP_JSON))
 
     # ============================
     # INITIAL GUESS ROLLOUT
@@ -1006,9 +1015,13 @@ class NeuralMPC:
             self.rate.sleep()
 
 
-if __name__ == "__main__":
+def main():
     c = NeuralMPC()
     try:
         c.run()
     except rospy.ROSInterruptException:
         pass
+
+
+if __name__ == "__main__":
+    main()

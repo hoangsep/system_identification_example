@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from gem_mpc import paths
+
 # Constants from mpc.py
 COL_X = 0
 COL_Y = 1
@@ -65,7 +67,7 @@ def calculate_velocity_profile(path):
 
 def main():
     # Load and process
-    df = pd.read_csv('wps.csv', header=None)
+    df = pd.read_csv(paths.WAYPOINTS_CSV, header=None)
     raw_path = df.values
     
     # Original data
@@ -83,7 +85,7 @@ def main():
     # Subplot 1: Velocity
     plt.subplot(2, 1, 1)
     # Plot 1: Original Velocity
-    plt.plot(np.linspace(0, 1, len(original_v)), original_v, label='Original wps.csv Velocity', color='red', alpha=0.5)
+    plt.plot(np.linspace(0, 1, len(original_v)), original_v, label='Original waypoint velocity', color='red', alpha=0.5)
 
     
     # Plot 2: Calculated Velocity
@@ -103,7 +105,7 @@ def main():
     plt.axis('equal')
     plt.grid(True)
     
-    output_file = 'velocity_comparison.png'
+    output_file = paths.result('velocity_comparison.png')
     plt.savefig(output_file)
     print(f"Comparison saved to {output_file}")
     

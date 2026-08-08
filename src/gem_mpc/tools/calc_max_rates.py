@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Compute the maximum absolute acceleration and steering rate across all log CSVs in neo_data.
+Compute the maximum absolute acceleration and steering rate across all log CSVs in data/.
 
 Acceleration is derived from successive differences of v_actual over time; steering rate is taken
 from the recorded steer_rate column when present, otherwise derived from steer_actual.
@@ -9,6 +9,8 @@ from pathlib import Path
 import argparse
 import numpy as np
 import pandas as pd
+
+from gem_mpc import paths
 
 
 def compute_metrics(csv_path: Path):
@@ -43,8 +45,8 @@ def compute_metrics(csv_path: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute max accel and steering rate from neo_data CSV logs.")
-    parser.add_argument("--data-dir", type=Path, default=Path("neo_data"), help="Directory containing CSV logs.")
+    parser = argparse.ArgumentParser(description="Compute max accel and steering rate from recorded CSV logs.")
+    parser.add_argument("--data-dir", type=Path, default=paths.DATA_DIR, help="Directory containing CSV logs.")
     args = parser.parse_args()
 
     csv_files = sorted(args.data_dir.glob("*.csv"))

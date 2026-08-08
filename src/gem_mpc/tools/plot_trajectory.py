@@ -3,7 +3,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import sys
 
-def plot_trajectory(pickle_path='mpc_trajectories.pkl', target_time=85.0):
+from gem_mpc import paths
+
+def plot_trajectory(pickle_path=paths.RESULTS_DIR / "mpc_trajectories.pkl", target_time=85.0):
     try:
         with open(pickle_path, 'rb') as f:
             data = pickle.load(f)
@@ -44,8 +46,9 @@ def plot_trajectory(pickle_path='mpc_trajectories.pkl', target_time=85.0):
     plt.legend()
     plt.grid(True)
     
-    plt.savefig('trajectory_debug.png')
-    print("Saved trajectory_debug.png")
+    out = paths.result('trajectory_debug.png')
+    plt.savefig(out)
+    print(f"Saved {out}")
 
 if __name__ == "__main__":
     t = float(sys.argv[1]) if len(sys.argv) > 1 else 85.0

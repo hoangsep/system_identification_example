@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
+import argparse
 import rospy
 import pandas as pd
 import math
+import time
+from pathlib import Path
 from gazebo_msgs.msg import ModelStates
 from ackermann_msgs.msg import AckermannDrive
 from sensor_msgs.msg import JointState
 from tf.transformations import euler_from_quaternion
 
+from gem_mpc import paths
+
 class DataRecorder:
-    def __init__(self):
+    def __init__(self, out_path: Path = None):
         rospy.init_node('data_recorder', anonymous=True)
-        
+
+        # default to a timestamped log inside data/ so runs never overwrite
+        self.out_path = Path(out_path) if out_path else (
+            paths.DATA_DIR / f"gem_data_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        )
+
         # Configuration
         self.robot_name = "gem" 
         self.data = []
@@ -28,7 +38,7 @@ class DataRecorder:
         rospy.Subscriber("/gazebo/model_states", ModelStates, self.state_callback)
         rospy.Subscriber("/gem/joint_states", JointState, self.joint_state_callback)
         
-        print("Recorder started. Driving data will be saved on shutdown...")
+        print(f"Recorder started. Data will be saved to {self.out_path} on shutdown...")
 
     def cmd_callback(self, msg):
         # Store the latest command
@@ -96,14 +106,30 @@ class DataRecorder:
 
     def save_data(self):
         df = pd.DataFrame(self.data)
-        df.to_csv('gem_data.csv', index=False)
-        print(f"Data saved to gem_data.csv with {len(df)} rows.")
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(self.out_path, index=False)
+        print(f"Data saved to {self.out_path} with {len(df)} rows.")
 
-if __name__ == '__main__':
-    recorder = DataRecorder()
+
+def main():
+    parser = argparse.ArgumentParser(description="Record GEM driving data to CSV.")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="output CSV path (default: data/gem_data_<timestamp>.csv)",
+    )
+    # myargv strips the remapping arguments roslaunch appends
+    args = parser.parse_args(rospy.myargv()[1:])
+
+    recorder = DataRecorder(out_path=args.out)
     try:
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
     finally:
         recorder.save_data()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gem-mpc"
+version = "0.1.0"
+description = "Neural system identification and NMPC for the Polaris GEM e2 simulator"
+readme = "README.md"
+requires-python = ">=3.8"
+
+# rospy, tf and the ROS message packages come from the ROS Noetic install;
+# acados_template is installed from the acados source tree by the Dockerfile
+dependencies = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "scipy",
+    "scikit-learn",
+    "torch",
+    "casadi",
+]
+
+[project.scripts]
+gem-mpc = "gem_mpc.mpc:main"
+gem-train = "gem_mpc.train_model:main"
+gem-record = "gem_mpc.data_recorder:main"
+gem-validate = "gem_mpc.validate_model:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

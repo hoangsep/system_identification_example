@@ -2,7 +2,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-def check_yaw(csv_path='wps.csv'):
+from gem_mpc import paths
+
+def check_yaw(csv_path=paths.WAYPOINTS_CSV):
     df = pd.read_csv(csv_path, header=None)
     path = df.values
     
@@ -28,7 +30,7 @@ def check_yaw(csv_path='wps.csv'):
     plt.figure(figsize=(10,6))
     plt.plot(yaw, label='Yaw')
     plt.title("Path Yaw (Downsampled)")
-    plt.savefig("yaw_check.png")
+    plt.savefig(paths.result("yaw_check.png"))
     
     max_jump = np.max(np.abs(diffs))
     print(f"Max Yaw Jump: {max_jump:.4f} rad")

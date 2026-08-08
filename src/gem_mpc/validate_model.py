@@ -4,10 +4,12 @@ import torch
 import sys
 import pickle
 
+from gem_mpc import paths
+
 # --- Configuration ---
-MODEL_PATH = 'gem_dynamics.pth'
-SCALER_PATH = 'gem_scaler.pkl'
-SCALER_ARRAY_PATH = 'gem_scaler_arrays.npz'
+MODEL_PATH = paths.MODEL_PATH
+SCALER_PATH = paths.SCALER_PATH
+SCALER_ARRAY_PATH = paths.SCALER_ARRAY_PATH
 DT = 0.1 # Testing with base DT
 
 class ModelValidator:
@@ -47,9 +49,18 @@ class ModelValidator:
                 print(f"Failed to load scalers: {e2}")
                 sys.exit(1)
 
-    def predict(self, v_actual, v_cmd, steer_cmd, steer_actual, dt=DT):
-        # Input: [v_actual, v_cmd, steer_cmd, steer_actual, dt]
-        inp = np.array([v_actual, v_cmd, steer_cmd, steer_actual, dt], dtype=float)
+    def predict(self, v_actual, v_cmd, steer_cmd, steer_actual, dt=DT,
+                yaw_rate=0.0, prev_v_cmd=None, prev_steer_cmd=None):
+        # 8D input, same ordering as train_model.load_and_process_data:
+        # [v, steer_actual, yaw_rate, cmd_speed, cmd_steer, dt, prev_cmd_speed, prev_cmd_steer]
+        # these are open-loop steady-state probes, so the previous command
+        # defaults to the current one and the vehicle starts unyawed
+        prev_v_cmd = v_cmd if prev_v_cmd is None else prev_v_cmd
+        prev_steer_cmd = steer_cmd if prev_steer_cmd is None else prev_steer_cmd
+        inp = np.array(
+            [v_actual, steer_actual, yaw_rate, v_cmd, steer_cmd, dt, prev_v_cmd, prev_steer_cmd],
+            dtype=float,
+        )
         inp_norm = (inp - self.sx_mean) / self.sx_scale
 
         # Forward Pass (Tanh activations)
@@ -59,7 +70,7 @@ class ModelValidator:
         h3 = act(self.weights['net.4.weight'].dot(h2) + self.weights['net.4.bias'])
         out_norm = self.weights['net.6.weight'].dot(h3) + self.weights['net.6.bias']
         
-        # Denormalize Output: [dx_body, dy_body, d_yaw, d_v]
+        # Denormalize Output: [dx_local, dy_local, d_yaw, d_v, d_steer]
         out_real = out_norm * self.sy_scale + self.sy_mean
         return out_real
 
@@ -162,6 +173,10 @@ class ModelValidator:
             print("Recommendation: The model is not learning the dynamics correctly.")
             print("Possible causes: Poor data coverage, wrong normalization, or too much regularization.")
 
-if __name__ == "__main__":
+def main():
     validator = ModelValidator()
     validator.run_tests()
+
+
+if __name__ == "__main__":
+    main()

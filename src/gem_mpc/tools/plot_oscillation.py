@@ -3,7 +3,9 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
-def plot_oscillation(csv_path='mpc_debug.csv'):
+from gem_mpc import paths
+
+def plot_oscillation(csv_path=paths.RESULTS_DIR / "mpc_debug.csv"):
     if not os.path.exists(csv_path):
         print(f"File {csv_path} not found.")
         return
@@ -86,9 +88,10 @@ def plot_oscillation(csv_path='mpc_debug.csv'):
     plt.grid(True)
 
     plt.tight_layout()
-    plt.savefig('oscillation_debug.png')
-    print("Saved oscillation_debug.png")
+    out = paths.result('oscillation_debug.png')
+    plt.savefig(out)
+    print(f"Saved {out}")
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else 'mpc_debug.csv'
+    path = sys.argv[1] if len(sys.argv) > 1 else paths.RESULTS_DIR / "mpc_debug.csv"
     plot_oscillation(path)

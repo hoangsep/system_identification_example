@@ -3,7 +3,9 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import numpy as np
 
-DATA_DIR = Path('data')
+from gem_mpc import paths
+
+DATA_DIR = paths.DATA_DIR
 
 def analyze_steering():
     csv_files = sorted(DATA_DIR.glob("*.csv"))
@@ -34,8 +36,8 @@ def analyze_steering():
     plt.title("Steering Command Distribution (Log Scale)")
     plt.xlabel("Steer Angle (rad)")
     plt.ylabel("Count")
-    plt.savefig("data_distribution.png")
-    print("Saved histogram to data_distribution.png")
+    plt.savefig(paths.result("data_distribution.png"))
+    print(f"Saved histogram to {paths.result('data_distribution.png')}")
 
 if __name__ == "__main__":
     analyze_steering()

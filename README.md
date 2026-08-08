@@ -1,72 +1,102 @@
-# Polaris GEM System Identification & Neural MPC (acados)
+# Polaris GEM: Neural System Identification + acados NMPC
 
-Python + ROS/Gazebo workflow to:
-1) record Polaris GEM simulator data to CSV,
-2) learn a neural 1‑step dynamics model (local-frame deltas),
-3) run NMPC with **acados (SQP‑RTI)** using the learned model.
+Learn the dynamics of the Polaris GEM e2 from simulator logs, then drive it with a
+nonlinear MPC that uses the learned network as its prediction model.
 
-Key scripts:
-- `data_recorder.py`: logs ROS topics to CSV
-- `train_model.py`: trains the neural dynamics + saves scalers/plots
-- `mpc.py`: neural MPC controller (acados + CasADi)
-- Plot helpers: `plot_oscillation.py`, `plot_trajectory.py`
+The pipeline is three steps:
 
-Pre-trained artifacts are included: `gem_dynamics.pth`, `gem_scaler.pkl`, `gem_scaler_arrays.npz`.
+1. **Record** driving data from the ROS/Gazebo simulator to CSV
+2. **Identify** a 1-step dynamics model: a small MLP that maps the current state and
+   command to local-frame state deltas
+3. **Control** with acados (SQP-RTI), embedding the same network inside CasADi so the
+   optimizer differentiates through it
 
-## Build & Run the Simulation
-- Build the ROS/Gazebo image (uses `Dockerfile`):  
-  ```bash
-  docker compose build
-  ```
-- Start a container with GUI passthrough (needs X server on host):  
-  ```bash
-  xhost +local:root             # allow X11 (optional if already set)
-  docker compose up -d
-  docker exec -it gem_mpc_container bash
-  ```
-- Inside the container:  
-  ```bash
-  source /opt/ros/noetic/setup.bash
-  cd /root/catkin_ws
-  catkin_make                     # rebuild after mounting this repo into src/assignment
-  source devel/setup.bash
-  ```
-- Launch Gazebo/RViz for the GEM simulator:  
-  ```bash
-  roslaunch gem_gazebo gem_gazebo_rviz.launch
-  ```
-  (Adjust the launch file as needed for your scenario/track.)
-- In another shell in the same container, run the controller from this repo:  
-  ```bash
-  source /root/catkin_ws/devel/setup.bash
-  cd /root/catkin_ws/src/assignment
-  python mpc.py
-  ```
-  The node subscribes to `/gazebo/model_states`, `/gem/joint_states`, `/gem/imu` and publishes `/gem/ackermann_cmd` (and RViz debug markers on `/gem/mpc_debug`).
+![System identification validation](docs/images/sysid_validation_plot.png)
 
-## System Identification Workflow
-- **Data capture**: Run the simulator, then log data with `python data_recorder.py` (from this repo with ROS environment sourced). Drive with `manual_driver.py` (keyboard) or `auto_driver.py` to excite the system.
-  - By default the recorder writes `gem_data.csv` in the repo root; move/rename it into `neo_data/` (e.g. `mv gem_data.csv neo_data/run_001.csv`) or pass a different directory to training via `--data-dir`.
-  - Required columns for training: `time`, `cmd_speed`, `cmd_steer`, `steer_actual`, `x`, `y`, `yaw`, `v_actual`, `yaw_rate` (`steer_rate` is optional).
-- **Training**: Fit the neural dynamics model and scalers (default reads `neo_data/*.csv`):  
-  ```bash
-  python train_model.py
-  ```
-  Outputs:
-  - `gem_dynamics.pth`
-  - `gem_scaler.pkl`, `gem_scaler_arrays.npz`
-  - `sysid_validation_plot.png` (actual vs. predicted deltas + scatter)
-  - `sysid_input_output.png` (input/output overview)
-  - `rmse_plot.png` (RMSE by subset)
+*Predicted vs. actual 1-step deltas on the held-out test split.*
 
-## MPC Controller
-- `mpc.py` reconstructs the trained network inside CasADi and solves NMPC with **acados (SQP‑RTI)** over a horizon of size `HORIZON` at timestep `DT`.
-- The controller uses the learned 1‑step deltas `(dx_local, dy_local, d_yaw, d_v, d_steer)`, warm-starts from the previous solution, enforces accel/steer-rate constraints, and publishes `AckermannDrive` commands.
-- On shutdown it writes `mpc_debug.csv`, `mpc_trajectories.pkl`, and saves plots `mpc_cte_signed.png` and `mpc_rmse.png`. Use `python plot_oscillation.py mpc_debug.csv` to generate `oscillation_debug.png`.
+## Quickstart
 
-## Dockerfile (Dependencies)
-- Base: `osrf/ros:noetic-desktop-full`.
-- Apt: `ros-noetic-ackermann-msgs`, `ros-noetic-ros-control`, `ros-noetic-gazebo-ros-control`, `ros-noetic-jsk-rviz-plugins`, and common ROS/Gazebo dependencies.
-- Python: `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `scipy`, `torch`, `torchvision`, `casadi`.
-- MPC solver: `acados` C library + `acados_template` Python interface, installed by the Dockerfile to `/opt/acados` (with `ACADOS_SOURCE_DIR`, `LD_LIBRARY_PATH`, and `PYTHONPATH` set).
-- Initializes a catkin workspace at `/root/catkin_ws` and pre-builds it; `docker-compose.yml` mounts this repo into `/root/catkin_ws/src/assignment` for live edits.
+```bash
+# 1. build the ROS Noetic + Gazebo + acados image
+docker compose build
+
+# 2. start the container (needs an X server on the host)
+xhost +local:root
+docker compose up -d
+docker exec -it gem_mpc_container bash
+
+# 3. inside the container, build the catkin workspace once
+cd /root/catkin_ws && catkin_make && source devel/setup.bash
+
+# 4. launch the simulator
+roslaunch gem_gazebo gem_gazebo_rviz.launch
+
+# 5. in a second shell in the same container, run the controller
+python3 -m gem_mpc.mpc
+```
+
+Training and all offline analysis need neither ROS nor acados, so they also run
+directly on the host:
+
+```bash
+pip install -e .
+gem-train                       # or: python -m gem_mpc.train_model
+```
+
+Full environment notes are in [docs/setup.md](docs/setup.md).
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| [src/gem_mpc/](src/gem_mpc/) | The package: controller, trainer, recorder, validator |
+| [src/gem_mpc/tools/](src/gem_mpc/tools/) | Analysis and plotting helpers, manual/auto drivers |
+| [src/gem_mpc/paths.py](src/gem_mpc/paths.py) | Repo-anchored paths, so scripts run from any directory |
+| [data/](data/) | Recorded driving logs, ~900k samples ([schema](data/README.md)) |
+| [models/](models/) | Trained weights `gem_dynamics.pth` and the input/output scalers |
+| [waypoints/](waypoints/) | `wps.csv`, the reference path the controller follows |
+| [results/](results/) | Run outputs: debug logs, trajectory dumps, generated plots |
+| [docs/](docs/) | Setup, method and results documentation |
+| [POLARIS_GEM_e2/](POLARIS_GEM_e2/) | Vendored upstream simulator (third party, see below) |
+
+## Entry points
+
+Installing the package (`pip install -e .`) provides four commands; each is also
+runnable as `python -m gem_mpc.<module>`.
+
+| Command | Module | What it does |
+|---|---|---|
+| `gem-record` | `gem_mpc.data_recorder` | Logs ROS topics to `data/gem_data_<timestamp>.csv` |
+| `gem-train` | `gem_mpc.train_model` | Fits the dynamics model, writes `models/` and validation plots |
+| `gem-mpc` | `gem_mpc.mpc` | Runs the NMPC ROS node |
+| `gem-validate` | `gem_mpc.validate_model` | Sanity-checks the trained model against a kinematic baseline |
+
+## Documentation
+
+- [Setup](docs/setup.md): Docker, ROS, acados, running without a container
+- [System identification](docs/system_identification.md): data format, features, targets, training
+- [MPC](docs/mpc.md): OCP formulation, cost, constraints, ROS interface, tuning knobs
+- [Results](docs/results.md): what the generated figures show
+- [Tools](docs/tools.md): the analysis scripts and what each one is for
+- [Data schema](data/README.md): CSV columns, units, sample rates
+
+## Model at a glance
+
+| | |
+|---|---|
+| Inputs (8) | `v`, `steer_actual`, `yaw_rate`, `cmd_speed`, `cmd_steer`, `dt`, `prev_cmd_speed`, `prev_cmd_steer` |
+| Outputs (5) | `dx_local`, `dy_local`, `d_yaw`, `d_v`, `d_steer` |
+| Network | 8 → 64 → 64 → 32 → 5, `tanh` activations |
+| Control step | 50 ms (20 Hz) |
+| Horizon | 20 steps (1.0 s) |
+| Solver | acados SQP-RTI, `PARTIAL_CONDENSING_HPIPM`, discrete integrator |
+
+## Third-party components
+
+[POLARIS_GEM_e2/](POLARIS_GEM_e2/) is a vendored copy of the
+[POLARIS_GEM_e2 simulator](https://github.com/hangcui1201/POLARIS_GEM_e2) from the
+University of Illinois. It is included so the catkin workspace builds from a single
+clone; it is not part of this project's work and keeps its own licenses (see the
+`LICENSE` files inside its packages). Everything under `src/gem_mpc/` is this
+project's code.

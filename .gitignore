@@ -1,14 +1,19 @@
 __pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
 
-# Acados generated files
-*.so
-*.o
-*_cost/
-*_model/
-acados_solver_*.c
-acados_solver_*.h
-acados_sim_*.c
-acados_sim_*.h
+# acados code generation and solver description
+build/
 c_generated_code/
 c_generated_code_*/
-*.json
+acados_ocp*.json
+acados_sim*.json
+*.so
+*.o
+
+# run outputs (already-tracked files under results/ are unaffected)
+results/
+
+# editor
+.vscode/

@@ -4,7 +4,9 @@ import matplotlib.pyplot as plt
 import sys
 import os
 
-def plot_path(csv_path='wps.csv'):
+from gem_mpc import paths
+
+def plot_path(csv_path=paths.WAYPOINTS_CSV):
     if not os.path.exists(csv_path):
         print(f"File {csv_path} not found.")
         return
@@ -50,10 +52,10 @@ def plot_path(csv_path='wps.csv'):
     plt.grid(True)
     plt.legend()
     
-    output_file = 'path_debug.png'
+    output_file = paths.result('path_debug.png')
     plt.savefig(output_file, dpi=300) # High DPI
     print(f"Saved {output_file} (High Res)")
 
 if __name__ == "__main__":
-    path = sys.argv[1] if len(sys.argv) > 1 else 'wps.csv'
+    path = sys.argv[1] if len(sys.argv) > 1 else paths.WAYPOINTS_CSV
     plot_path(path)

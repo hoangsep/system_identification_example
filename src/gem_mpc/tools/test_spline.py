@@ -4,13 +4,15 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import splprep, splev
 import sys
 
-def test_spline_fit(csv_path='wps.csv'):
+from gem_mpc import paths
+
+def test_spline_fit(csv_path=paths.WAYPOINTS_CSV):
     # Load Data
     try:
         df = pd.read_csv(csv_path, header=None)
         path = df.values # [x, y, yaw, v, ...]
     except:
-        print("wps.csv not found")
+        print(f"{csv_path} not found")
         return
 
     x = path[:, 0]
@@ -69,8 +71,9 @@ def test_spline_fit(csv_path='wps.csv'):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('spline_debug.png')
-    print("Saved spline_debug.png")
+    out = paths.result('spline_debug.png')
+    plt.savefig(out)
+    print(f"Saved {out}")
 
 if __name__ == "__main__":
     test_spline_fit()
